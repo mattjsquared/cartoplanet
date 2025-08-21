@@ -1,0 +1,30 @@
+name: cartoplanet
+channels:
+  - conda-forge
+dependencies:
+  - python=3.9
+  - jupyterlab
+  - notebook
+  - numpy
+  - scipy
+  - sympy
+  - matplotlib
+  - seaborn
+  - openpyxl
+  - xarray
+  - pandas
+  - geopandas
+  - fiona
+  - gdal
+  - cartopy
+  - pyproj
+  - shapely
+  - rasterio
+  - scikit-image
+  - pyshtools
+  - pyinterp
+  - xESMF
+  - setuptools
+  - pip
+  - pip:
+      - ctplanet

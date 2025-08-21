@@ -1,0 +1,33 @@
+
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# Note: Some dependencies (pyinterp, xESMF) are conda-forge only. See README for installation guidance.
+
+[project]
+name = "cartoplanet"
+version = "0.1.0"
+description = "Publication-quality planetary mapping and spherically-aware geospatial processing"
+authors = [
+	{ name = "Matthew Jones" }
+]
+requires-python = ">=3.9"
+dependencies = [
+	"numpy",
+	"scipy",
+	"sympy",
+	"matplotlib",
+	"seaborn",
+	"openpyxl",
+	"xarray",
+	"pandas",
+	"geopandas",
+	"fiona",
+	"rasterio",
+	"scikit-image",
+	"pyshtools",
+	"jupyterlab",
+	"notebook",
+	"ctplanet",
+]
