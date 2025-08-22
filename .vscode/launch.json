@@ -1,0 +1,11 @@
+{
+  "configurations": [
+    {
+      "name": "Python: Debug cartoplanet",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "cwd": "/Users/mattjones/Brown Dropbox/Matthew Jones/Packages/cartoplanet"
+    }
+  ]
+}
