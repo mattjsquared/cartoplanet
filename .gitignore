@@ -1,3 +1,5 @@
+
+# Python cache and build artifacts
 __pycache__/
 *.pyc
 *.pyo
@@ -7,3 +9,35 @@ __pycache__/
 build/
 dist/
 setup.py
+
+# Jupyter and notebook artifacts
+.ipynb_checkpoints/
+*.ipynb
+
+# VS Code and editor files
+.vscode/
+.idea/
+
+# Test and coverage outputs
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Images and output
+img/
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
+
+# Environment files
+.mypy_cache/
+.mypy_temp/
+.pylint.d/
+
