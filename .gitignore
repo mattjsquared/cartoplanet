@@ -41,3 +41,6 @@ img/
 .mypy_temp/
 .pylint.d/
 
+# Other
+DESIGN.md
+

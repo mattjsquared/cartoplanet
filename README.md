@@ -35,21 +35,38 @@ pip install cartoplanet
 ### Python API
 
 ```python
+import numpy as np
 from cartoplanet.canvas import Canvas
-from cartoplanet.projections import projections
+from cartoplanet.layer import GridLayer
+from cartoplanet.projections import PLATE_CARREE, projections
 from cartoplanet.boundaries import boundaries
 
 # Create a 2x2 canvas with colorbar axis
-canvas = Canvas(nrows=2, ncols=2, with_cax=True)
+canvas = Canvas(
+  nrows=1, ncols=2, 
+  with_cax=True,
+  projections=[projections['LAEA_NS'], projections['LAEA_FS']]
+  boundaries=boundaries['limb_circle']
+)
 
-# Plot demo data on the first pane
-canvas[0].plot_demo()
+# Create demo grid data
+lon = np.linspace(-180, 180, 30)
+lat = np.linspace(-90, 90, 15)
+Lon, Lat = np.meshgrid(lon, lat)
+Z = np.sin(np.radians(Lat)) * np.cos(np.radians(Lon))
 
-# Update projections and boundaries for all panes
-proj = [projections['LAEA_NS'], projections['LAEA_FS']] * 2
-bound = [boundaries['limb_circle']] * 4
-for i, pane in enumerate(canvas):
-  pane.update(projection=proj[i], boundary=bound[i])
+# Wrap data in a GridLayer
+grid_layer = GridLayer(
+  name="demo",
+  data=Z,
+  lat=lat,
+  lon=lon,
+  crs=PLATE_CARREE
+)
+
+# Plot using Pane.draw
+canvas[0].draw(grid_layer, cmap="viridis")
+canvas[0].ax.set_title("Low-resolution grid demo")
 
 # Show or save the figure
 canvas.show()
@@ -70,8 +87,12 @@ Arguments:
 
 ## API Overview
 
-- `Canvas`: Main plotting engine. Supports flexible grid layouts, colorbar axes, and batch operations.
-- `Pane`: Represents a single subplot. Attributes: `ax`, `projection`, `boundary`. Methods: `plot_demo()`, `update()`.
+- `Canvas`: Main plotting engine. Manages figure, grid layout, colorbar axes, and batch operations. Use `canvas[i]` to access panes.
+- `Pane`: Represents a single subplot. Attributes: `ax`, `projection`, `boundary`. Methods: `draw(layer, **style)`, `update()`, `plot_demo()`.
+- `Layer`: Abstract data wrapper. Subclasses:
+  - `GridLayer`: 2D gridded data (e.g., `xarray.DataArray`, `numpy.ndarray`).
+- `Renderer`: Stateless drawing engine. Subclasses:
+  - `GridRenderer`: Plots grids/images.
 
 ## Development and Testing
 

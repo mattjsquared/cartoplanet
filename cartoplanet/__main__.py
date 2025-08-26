@@ -9,14 +9,14 @@ def main(args):
     nrows=args.nrows, ncols=args.ncols,
     with_cax=True
   )
-  # canvas[0].plot_demo()
-  canvas.save(args.filename[0])
+  canvas[0].plot_demo()
+  canvas.save(args.out[0])
   proj = [projections['LAEA_NS'], projections['LAEA_FS']]*2
   bound = [boundaries['limb_circle'], boundaries['limb_circle']]*2
   for i, pane in enumerate(canvas):
     pane.update(projection=proj[i], boundary=bound[i])
-  # canvas[0].plot_demo()
-  canvas.save(args.filename[1])
+  canvas[0].plot_demo()
+  canvas.save(args.out[1])
 
 if __name__ == "__main__":
   import argparse, os

@@ -11,6 +11,8 @@ import warnings
 from typing import Optional, Union, List, Tuple, Dict, Any
 from cartoplanet.projections import GLOBE, PLATE_CARREE
 from cartoplanet.types import ProjectionType, BoundaryType, KWType
+from cartoplanet.layer import Layer
+from cartoplanet.renderer import RENDERERS
 
 
 class Canvas:
@@ -283,12 +285,32 @@ class Pane:
     verts = boundary.vertices
     self.ax.set_extent([verts[:,0].min(), verts[:,0].max(), verts[:,1].min(), verts[:,1].max()], crs=tf)
 
+  def draw(
+      self,
+      layer: Layer,
+      **style
+  ):
+    renderer = RENDERERS.get(layer.kind)
+    if renderer:
+      return renderer.draw(layer=layer, ax=self.ax, **style)
+    else:
+      raise ValueError(f"Unknown layer kind: {layer.kind}")
+
   def plot_demo(self):
     # Generate a low-resolution grid
     lon = np.linspace(-180, 180, 30)
     lat = np.linspace(-90, 90, 15)
     Lon, Lat = np.meshgrid(lon, lat)
     Z = np.sin(np.radians(Lat)) * np.cos(np.radians(Lon))
-    # Plot the grid, handling projection automatically
-    pc = self.ax.pcolormesh(Lon, Lat, Z, transform=PLATE_CARREE)
+    # Create GridLayer
+    from cartoplanet.layer import GridLayer
+    grid_layer = GridLayer(
+      name="demo",
+      data=Z,
+      lat=lat,
+      lon=lon,
+      crs=PLATE_CARREE
+    )
+    # Plot using Pane.draw
+    self.draw(grid_layer, cmap="viridis", shading='nearest')
     self.ax.set_title('Low-resolution grid demo')
