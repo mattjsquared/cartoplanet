@@ -13,26 +13,24 @@ class GridRenderer(Renderer):
     super().__init__()
 
   def draw(self, layer, ax, **style):
-    lon, lat = layer.get_coord_grids()
-    return ax.pcolormesh(lon, lat, layer.data.values, transform=layer.crs, **style)
+    xgrid, ygrid = layer.get_coord_grids()
+    return ax.pcolormesh(xgrid, ygrid, layer.data.values, transform=layer.crs, **style)
 
 
 class PointRenderer(Renderer):
   def __init__(self):
     super().__init__()
 
-  def draw(self, layer, pane, **style):
-    # Will implement point plotting logic here
-    pass
+  def draw(self, layer, ax, **style):
+    return ax.scatter(layer.x, layer.y, transform=layer.crs, **style)
 
 
 class GeometryRenderer(Renderer):
   def __init__(self):
     super().__init__()
 
-  def draw(self, layer, pane, **style):
-    # Will implement geometry plotting logic here
-    pass
+  def draw(self, layer, ax, **style):
+    return layer.data.plot(ax=ax, **style)
 
 
 class SHRenderer(Renderer):

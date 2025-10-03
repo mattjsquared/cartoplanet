@@ -17,6 +17,7 @@ setup.py
 # VS Code and editor files
 .vscode/
 .idea/
+*.code-workspace
 
 # Test and coverage outputs
 .pytest_cache/

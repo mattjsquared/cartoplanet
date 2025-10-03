@@ -2,6 +2,7 @@ import numpy as np
 import matplotlib as mpl
 import cartopy.crs as ccrs
 import xarray as xr
+import pandas as pd
 
 from typing import Optional, Union, List, Dict, Any
 
@@ -12,5 +13,7 @@ KWType = Optional[Dict[str, Any]]
 
 # Data
 GridType = Union[np.ndarray, xr.Dataset, xr.DataArray]
-CoordType = Optional[Union[list, np.ndarray, xr.DataArray]]
+CoordType = Union[list, np.ndarray, str]
+VectorType = Union[list, np.ndarray, pd.Series]
+ScatterType = Union[list, dict, np.ndarray, pd.DataFrame]
 

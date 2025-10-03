@@ -32,7 +32,7 @@ class Canvas:
   ) -> None:
     # Save metadata
     self.nrows = nrows
-    self.ncols = ncols
+    self.ncols = ncols  
     self.ax_height = ax_height
     # Set default canvas parameters
     kw_fig = kw_fig or {}
@@ -307,8 +307,8 @@ class Pane:
     grid_layer = GridLayer(
       name="demo",
       data=Z,
-      lat=lat,
-      lon=lon,
+      x=lat,
+      y=lon,
       crs=PLATE_CARREE
     )
     # Plot using Pane.draw

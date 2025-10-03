@@ -109,3 +109,52 @@ Arguments:
 ## License
 
 MIT
+
+Just for testing,
+
+> Here's a block quote
+
+```python
+# Here's a block of code
+var1 = 45
+var2 = lambda x: x + 1
+```
+
+`Here's inline code`
+
+---
+
+[Here's a link](https://www.example.com)
+
+<pre>
+# Here's a block of code
+var1 = 45
+var2 = lambda x: x + 1
+</pre>
+
+* Here's a list item
+* Here's another list item
+
+1. Here's a numbered list item
+2. Here's another numbered list item
+
+# Here's a subheading
+## Here's a sub-subheading
+### Here's a sub-sub-subheading
+
+<br><br>
+
+<hr>
+
+Hello
+
+
+| Syntax      | Description |
+| ----------- | ----------- |
+| Header      | Title       |
+| Paragraph   | Text        |
+
+
+- [x] item 1
+- [ ] item 2
+- [ ] I guess I can't do checkboxes here
