@@ -1,11 +1,13 @@
 
 # cartoplanet
 
-**A Python package for reproducible, publication-quality planetary mapping and spherically-aware geospatial processing.**
+**A Python package for reproducible, publication-quality planetary map figure–making and spherically-aware geospatial processing.**
 
 ## Features
 
-- Modular plotting architecture (`Canvas`, `Pane`) for flexible figure layouts
+- Modular plotting architecture (`Canvas`, `Pane`) for flexible, multi-projection figure layouts
+- Unified data model: `GridLayer`, `PointLayer`, `GeometryLayer`, and `SHLayer` for common planetary data types
+- Backend rendering pipeline for easy-to-use API
 - Spherical geospatial processing utilities
 - Publication-ready figure generation
 
@@ -38,15 +40,13 @@ pip install cartoplanet
 import numpy as np
 from cartoplanet.canvas import Canvas
 from cartoplanet.layer import GridLayer
-from cartoplanet.projections import PLATE_CARREE, projections
-from cartoplanet.boundaries import boundaries
+from cartoplanet.projections import PLATE_CARREE
 
-# Create a 2x2 canvas with colorbar axis
+# Create a 1x2 canvas with colorbar axis
 canvas = Canvas(
   nrows=1, ncols=2, 
   with_cax=True,
-  projections=[projections['LAEA_NS'], projections['LAEA_FS']]
-  boundaries=boundaries['limb_circle']
+  projections=[PLATE_CARREE, PLATE_CARREE]
 )
 
 # Create demo grid data
@@ -65,8 +65,11 @@ grid_layer = GridLayer(
 )
 
 # Plot using Pane.draw
-canvas[0].draw(grid_layer, cmap="viridis")
+h = canvas[0].draw(grid_layer, cmap="viridis")
 canvas[0].ax.set_title("Low-resolution grid demo")
+
+# Add a colorbar
+plt.colorbar(h, ax=canvas[0].ax, orientation='horizontal', label="Demo units")
 
 # Show or save the figure
 canvas.show()
@@ -87,12 +90,12 @@ Arguments:
 
 ## API Overview
 
-- `Canvas`: Main plotting engine. Manages figure, grid layout, colorbar axes, and batch operations. Use `canvas[i]` to access panes.
-- `Pane`: Represents a single subplot. Attributes: `ax`, `projection`, `boundary`. Methods: `draw(layer, **style)`, `update()`, `plot_demo()`.
+- `Canvas`: Main plotting engine. Manages figure, layout, colorbar axes, and batch operations. Use `canvas[i]` to access panes.
+- `Pane`: Represents a single subplot. Attributes: `ax`, `projection`, `boundary`. Methods: `draw(layer, **style)`, `update()`.
 - `Layer`: Abstract data wrapper. Subclasses:
-  - `GridLayer`: 2D gridded data (e.g., `xarray.DataArray`, `numpy.ndarray`).
-- `Renderer`: Stateless drawing engine. Subclasses:
-  - `GridRenderer`: Plots grids/images.
+  - `GridLayer`: 2D gridded data (e.g., `xarray.DataArray`, `numpy.ndarray`)
+  - `PointLayer`: Unstructured point data (e.g., `pandas.DataFrame`, `numpy.ndarray`)
+  - `GeometryLayer`: Polygons, lines, or points (e.g., `GeoDataFrame`, shapely geometries)
 
 ## Development and Testing
 
@@ -109,52 +112,3 @@ Arguments:
 ## License
 
 MIT
-
-Just for testing,
-
-> Here's a block quote
-
-```python
-# Here's a block of code
-var1 = 45
-var2 = lambda x: x + 1
-```
-
-`Here's inline code`
-
----
-
-[Here's a link](https://www.example.com)
-
-<pre>
-# Here's a block of code
-var1 = 45
-var2 = lambda x: x + 1
-</pre>
-
-* Here's a list item
-* Here's another list item
-
-1. Here's a numbered list item
-2. Here's another numbered list item
-
-# Here's a subheading
-## Here's a sub-subheading
-### Here's a sub-sub-subheading
-
-<br><br>
-
-<hr>
-
-Hello
-
-
-| Syntax      | Description |
-| ----------- | ----------- |
-| Header      | Title       |
-| Paragraph   | Text        |
-
-
-- [x] item 1
-- [ ] item 2
-- [ ] I guess I can't do checkboxes here
