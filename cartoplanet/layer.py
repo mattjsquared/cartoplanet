@@ -3,8 +3,12 @@ import xarray as xr
 import pandas as pd
 import geopandas as gpd
 import cartopy.crs as ccrs
+import pyshtools as pysh
+import warnings, pickle
 
 from typing import Union, Optional, Any
+from cartoplanet import config
+from cartoplanet.palette import Palette
 from cartoplanet.projections import PLATE_CARREE
 from cartoplanet.types import GridType, CoordType, VectorType, ScatterType
 
@@ -15,7 +19,8 @@ class Layer:
       name: str,
       kind: str,
       data: Optional[Any] = None,
-      crs: ccrs.Projection = None
+      crs: Optional[ccrs.Projection] = None,
+      palette: Optional[Any] = None
     ):
     # Validate input
     if (kind == 'sh') and (crs is not None):
@@ -25,46 +30,29 @@ class Layer:
     self._kind = kind
     self.data = data
     self.crs = crs or PLATE_CARREE
+    # self.palette = self.initialize_palette(palette)
 
   @property
   def kind(self):
     return self._kind
+  
+  # def initialize_palette(self, palette_spec):
+  #   if isinstance(palette_spec, (Palette, dict)):
+  #     palette = Palette(palette_spec)
+  #   elif palette_spec is not None:
+  #     raise TypeError("`palette_spec` must be able to initialize a `Palette` object.")
+  #   else:
+  #     try:
+  #       vmin = self.values.min()
+  #       vmax = self.values.max()
+  #     except:
+  #       vmin = None
+  #       vmax = None
+  #     palette = Palette(vmin=vmin, vmax=vmax)
+  #   return palette
 
-  def _raise_undefined(self, method_name: str):
+  def _raise_undefined_conversion(self, method_name: str):
     raise NotImplementedError(f"{method_name}() is not implemented for Layer of kind '{self._kind}'.")
-  
-  # def to_numpy(self):
-  #   self._raise_undefined()
-
-  # def to_xarray(self):
-  #   self._raise_undefined()
-  
-  # def to_dataframe(self):
-  #   self._raise_undefined()
-  
-  # def to_geodataframe(self):
-  #   self._raise_undefined()
-  
-  # def to_dict(self):
-  #   self._raise_undefined()
-  
-  # def to_shcoeff(self):
-  #   self._raise_undefined()
-  
-  # def to_shapely(self):
-  #   self._raise_undefined()
-  
-  # def to_path(self):
-  #   self._raise_undefined()
-  
-  # def to_file(self):
-  #   self._raise_undefined()
-  
-  # def to_pickle(self):
-  #   self._raise_undefined()
-  
-  # def to_netcdf(self):
-  #   self._raise_undefined()
 
 for method in [
   'to_numpy', 
@@ -77,9 +65,13 @@ for method in [
   'to_path', 
   'to_file', 
   'to_pickle', 
-  'to_netcdf'
+  'to_netcdf',
+  'to_grid',
+  'to_point',
+  'to_geometry',
+  'to_sh'
 ]:
-  setattr(Layer, method, lambda self, m=method: self._raise_undefined(m))  
+  setattr(Layer, method, lambda self, m=method: self._raise_undefined_conversion(m))
 
 class GridLayer(Layer):
   """
@@ -198,6 +190,47 @@ class GridLayer(Layer):
   
   def to_xarray(self):
     return self.data.copy()
+  
+  def to_point(self, new_name=None, kw_pointlayer=None):
+    # Validate inputs
+    name = new_name or self.name
+    kw_pointlayer = kw_pointlayer or {}
+    if kw_pointlayer.get('crs'):
+      warnings.warn("The `crs` argument to `PointLayer()` is ignored in `to_point()`; the GridLayer CRS is used.")
+      kw_pointlayer.pop('crs')
+    for k in ['data_name', 'xname', 'yname']:
+      if not kw_pointlayer.get(k):
+        kw_pointlayer[k] = getattr(self, f"{k}")
+    # Convert to PointLayer
+    xgrid, ygrid = self.get_coord_grids()
+    points = np.column_stack((self.data.values.ravel(), xgrid.ravel(), ygrid.ravel()))
+    pointlayer = PointLayer(
+      name=name, 
+      data=points, 
+      crs=self.crs, 
+      **kw_pointlayer
+    )
+    return pointlayer
+  
+  def to_sh(self, new_name=None, kind=None, kw_grid=None, kw_expand=None):
+    name = new_name or self.name
+    kw_grid = kw_grid or {}
+    kw_expand = kw_expand or {}
+    if kind in ['grav', 'gravity', 'SHGravGrid', 'SHGravCoeffs']:
+      grid = pysh.SHGravGrid.from_xarray(self.data, **kw_grid)
+    elif kind in ['mag', 'magnetic', 'SHMagGrid', 'SHMagCoeffs']:
+      grid = pysh.SHMagGrid.from_xarray(self.data, **kw_grid)
+    else:
+      grid = pysh.SHGrid.from_xarray(self.data, **kw_grid)
+    coeffs = grid.expand(**kw_expand)
+    shlayer = SHLayer(name=name, data=coeffs)
+    return shlayer
+  
+  def to_pickle(self, filepath, kw_pickle=None):
+    kw_pickle = kw_pickle or {}
+    with open(filepath, 'wb') as f:
+      pickle.dump(self, f, **kw_pickle)
+
 
 
 class PointLayer(Layer):
@@ -337,6 +370,16 @@ class PointLayer(Layer):
   
   def to_dict(self):
     return self.data.to_dict(orient='list')
+  
+  def to_grid(self, new_name=None, kw_gridlayer=None):
+    raise NotImplementedError("PointLayer.to_grid() is not yet implemented.")
+
+  def to_geometry(self, new_name=None, kw_geometrylayer=None):
+    raise NotImplementedError("PointLayer.to_geometry() is not yet implemented.")
+  
+  def to_sh(self, new_name=None, kw_expand=None, kw_shlayer=None):
+    raise NotImplementedError("PointLayer.to_sh() is not yet implemented.")
+
 
 
 
@@ -438,11 +481,62 @@ class GeometryLayer(Layer):
   # def bounds(self):
   #   return self.data.total_bounds
 
+  def to_grid(self, new_name=None, kw_gridlayer=None):
+    raise NotImplementedError("GeometryLayer.to_grid() is not yet implemented.")
+  
+  def to_point(self, new_name=None, kw_pointlayer=None):
+    raise NotImplementedError("GeometryLayer.to_point() is not yet implemented.")
+
 
 class SHLayer(Layer):
   def __init__(self, name, data, crs=None):
-    super().__init__(name=name, kind='sh', data=data, crs=crs)
-    
+    validated_data = self._validate_data(data)
+    super().__init__(name=name, kind='sh', data=validated_data, crs=crs)
+    if isinstance(validated_data, pysh.SHGravCoeffs):
+      self._SHkind = 'grav'
+    elif isinstance(validated_data, pysh.SHMagCoeffs):
+      self._SHkind = 'mag'
+    else:
+      self._SHkind = None
+
+  def _validate_data(self, data):
+    if not isinstance(data, (pysh.SHCoeffs, pysh.SHGravCoeffs, pysh.SHMagCoeffs)):
+      raise TypeError("SHLayer data must be an instance of pyshtools.SHCoeffs, pyshtools.SHGravCoeffs, or pyshtools.SHMagCoeffs.")
+    return data
+  
   @property
   def crs(self):
     raise AttributeError("SHLayer does not use a CRS.")
+  
+  @property
+  def lmax(self):
+    return self.data.lmax
+  
+  @property
+  def wavelength(self, R0: float=config.getfloat(config["BODY"]["body"], "R0")):
+    return 2*np.pi * R0 / np.sqrt(self.lmax*(self.lmax+1))
+  
+  # def __getattr__(self, attr):
+  #   return getattr(self.data, attr)
+
+  def to_numpy(self):
+    return self.data.coeffs
+  
+  def to_grid(self, new_name=None, kw_expand=None, kw_gridlayer=None):
+    name = new_name or self.name
+    kw_expand = kw_expand or {}
+    kw_gridlayer = kw_gridlayer or {}
+    if kw_expand.get('grid') == 'GLQ':
+      raise NotImplementedError("For now, `GridLayer`s support only regular grids, not Gauss-Legendre quadrature (GLQ) grids.")
+    grid = self.data.expand(**kw_expand)
+    grid_layer = GridLayer(
+      name=name,
+      data=grid.to_xarray(),
+      x='lon',
+      y='lat',
+      crs=PLATE_CARREE,
+      **kw_gridlayer
+    )
+    return grid_layer
+
+  

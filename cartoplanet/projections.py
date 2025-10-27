@@ -16,4 +16,5 @@ projections.update({
   'PC_FS': ccrs.PlateCarree(central_longitude=180.0, globe=GLOBE),
   'LAEA_NS': ccrs.LambertAzimuthalEqualArea(central_longitude=0, globe=GLOBE),
   'LAEA_FS': ccrs.LambertAzimuthalEqualArea(central_longitude=180.0, globe=GLOBE),
+  'MOLLWEIDE': ccrs.Mollweide(globe=GLOBE),
 })

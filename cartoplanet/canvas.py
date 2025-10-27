@@ -39,8 +39,8 @@ class Canvas:
     kw_gspec = kw_gspec or {}
     kw_ax = kw_ax or {}
     kw_fig.setdefault('facecolor', (1, 1, 1, 0))
-    kw_gspec.setdefault('hspace', 0.1)
-    kw_gspec.setdefault('wspace', 0.1)
+    kw_gspec.setdefault('hspace', 0.05)
+    kw_gspec.setdefault('wspace', -0.03)
     kw_ax.setdefault('facecolor', (1, 1, 1, 0))
     # Check inputs
     nax = nrows * ncols
