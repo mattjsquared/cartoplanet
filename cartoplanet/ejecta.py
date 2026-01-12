@@ -200,7 +200,6 @@ def compute_thickness_1D(
   
   ### //Largest secondary crater (LSC) parameters// ###
   lsc_distance_m = (7.21 * Rat_km**0.94) * 1e3         #r_LSC -- Eq. 10 of Xie et al. (2020) [**this is only valid for complex and larger craters**]
-  ### TODO: implement simple craters
   velocity_lsc    = _ejecta_velocity(lsc_distance_m)   #v_LSC -- Eq. 8 of Xie et al. (2020)
 
   ### //Fragment mass parameters// ###
@@ -218,9 +217,7 @@ def compute_thickness_1D(
   # Define excavation scaling parameter C_ex from Xie et al. (2020)
   C_ex = 3.5
   # Pre-compute unchanging factors for SOI-loop calculations
-  # *****TODO: double check 10000% that frag size should be radius and not diameter!!! original code used diameter and it makes a big difference!!!*****
   pre_frag_radius = (3 / (4*np.pi*rho_e))**(1/3)
-#   pre_frag_radius = 2 * (3 / (4*np.pi*rho_e))**(1/3)
   pre_sec_transient_radius1 = K1**(-(2+mu)/mu) * (g/vertical_velocity**2) * (rho_t/rho_e)**(2*nu/mu)
   pre_sec_transient_radius2 = K1**(-(2+mu)/mu) * (Y/(rho_t*vertical_velocity**2))**((2+mu)/mu) * (rho_t/rho_e)**(nu*(2+mu)/mu)
   exp_sec_transient_radius = -mu / (2+mu)
@@ -241,7 +238,6 @@ def compute_thickness_1D(
     def _central_effective_depth_i(m):                               #d_eff (Eq. 17 of Xie et al. (2020))
       a = pre_frag_radius * m**(1/3)
       sec_transient_radius = a * (pre_sec1_i*a + pre_sec2_i)**(exp_sec_transient_radius)
-      
       return pre_deff_i * sec_transient_radius
     
     def _coverage_frac_i(T_LM):
@@ -292,8 +288,7 @@ def compute_thickness_1D(
       return W                                                      #W(>T_LM)
     
     if (_coverage_frac_i(0) <= cov): raise ValueError(f"Maximum coverage {_coverage_frac_i(0)} is not greater than `cov` ({cov}).")
-    # Note: upper bracket (Tmax) can be e.g. thickness_primary[i] or max possible excavation depth
-    Tmax = _central_effective_depth_i(mh_i)
+    Tmax = _central_effective_depth_i(mh_i) # using max possible excavation depth as upper bound for T_LM -- this is the maximum thickness of local material that could be excavated by any fragment mass in this SOI
     # Integrate Eq. 19 of Xie et al. (2020)
     sol = root_scalar(
       lambda T: _coverage_frac_i(T) - cov,
