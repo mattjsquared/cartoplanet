@@ -1,6 +1,6 @@
 import numpy as np
 import xarray as xr
-import copy, warnings, tqdm
+import copy, warnings, tqdm, functools
 
 from scipy.integrate import quad
 from scipy.optimize import root_scalar
@@ -41,8 +41,440 @@ def great_circle_distance(lat1, lon1, lat2, lon2, R=config.getfloat(body, "R0")/
   return 2 * R * np.arcsin(np.sqrt(a))
 
 
-# Analytical solution for ballistic sedimentation model of Xie et al. (2020)
+class EjectaModel:
+  def __init__(
+    self,
+    theta0: float = 45,
+    rho_e: float = 3000,
+    rho_t: float = 3000,
+    b: float = 0.98,
+    cov: float = 0.5,
+    R0: float = 1737e3,
+    g: float = 1.62,
+    R_sc: float = 9.5e3,
+    C_mh: float = 0.013,
+    b_mt: float = 0.91,
+    b_v: float = -5.7,
+    material: str = "sand"
+  ):
+    '''
+    Initialize ejecta model parameters. Defaults are from Xie et al. (2020).
+
+    Parameters
+    ----------
+    ds_basin : xr.Dataset
+      Must contain:
+        - R   : basin rim radius (km)
+        - Rat : apparent transient crater radius (km); if NaN, will be estimated.
+    theta0 : float
+      Ejection angle of primary fragments (degrees).
+    rho_e : float
+      Density of primary ejected material, kg m⁻³.
+    rho_t : float
+      Density of target/local material, kg m⁻³.
+    b : float
+      Fragment-mass - frequency exponent.
+    cov : float
+      Desired coverage fraction (0-1) for local excavation.
+    R0 : float
+      Planetary radius, m.
+    g : float
+      Surface gravity, m s⁻².
+    R_sc : float
+      Simple-complex crater transition radius, m. Default is 9.5e3 m for the Moon [from Croft (1985), reported in Xie et al. (2020)].
+    nSOI : int
+      Number of radial bins (Squares of Interest) to compute.
+    rSOI : float or list of floats
+      If set, overrides `nSOI` to compute specific distances from the basin center (in km).
+    radius_cutoff : float or None
+      If set, maximum distance = radius_cutoff * Rt_km.
+    C_mh, b_mt, b_v : float
+      Parameters controlling upper/lower fragment-mass scalings (see below Eq. 7 of Xie et al. (2020)).
+    material : {"sand", "hard rock", "soft rock"}
+      Controls strength and scaling constants K1, μ, ν, Y.
+    '''
+    self.theta0 = np.radians(theta0)
+    self.rho_e = rho_e
+    self.rho_t = rho_t
+    self.b = b
+    self.cov = cov
+    self.R0 = R0
+    self.g = g
+    self.R_sc = R_sc
+    self.C_mh = C_mh
+    self.b_mt = b_mt
+    self.b_v = b_v
+    if material not in ["sand", "hard rock", "soft rock"]:
+      raise ValueError("`material` must be 'sand', 'hard rock', or 'soft rock'.")
+    self.material = material
+    self._set_material_properties()
+  
+  def _set_material_properties(self):
+    '''
+    Initialize material properties K1, nu, mu, Y based on the `material` parameter. Values are from Xie et al. (2020).
+    '''
+    if self.material == "sand":
+      K1 = 1.03
+      nu = 0.4
+      mu = 0.41
+      Y  = 10e3
+    elif self.material == "hard rock":
+      K1 = 0.93
+      nu = 0.4
+      mu = 0.55
+      Y  = 10e6
+    elif self.material == "soft rock":
+      K1 = 0.93
+      nu = 0.4
+      mu = 0.55
+      Y  = 1e6
+    self.K1 = K1
+    self.nu = nu
+    self.mu = mu
+    self.Y = Y
+    return
+
+
+def precompute_SOI(
+  ds_basin: xr.Dataset,
+  nSOI: int = 20,
+  rSOI: float | list[float] = None,
+  radius_cutoff: float = None,
+  ejecta_model: dict | EjectaModel = None
+):
+  """
+  Compute 1D radial profiles of primary ejecta thickness, local excavation thickness,
+  and total ejecta thickness for a lunar basin.
+
+  Parameters
+  ----------
+  ds_basin : xr.Dataset
+    Must contain:
+      - R   : basin rim radius (km)
+      - Rat : apparent transient crater radius (km); if NaN, will be estimated.
+  nSOI : int
+    Number of radial bins (Squares of Interest) to compute.
+  rSOI : float or list of floats
+    If set, overrides `nSOI` to compute specific distances from the basin center (in km).
+  radius_cutoff : float or None
+    If set, maximum distance = radius_cutoff * Rt_km.
+  ejecta_model : dict or EjectaModel
+    If dict, must contain the following keys (with values as described in the EjectaModel class):
+    - theta0 : float
+    - rho_e : float
+    - rho_t : float
+    - b : float
+    - cov : float
+    - R0 : float
+    - g : float
+    - R_sc : float
+    - C_mh : float
+    - b_mt : float
+    - b_v : float
+    - material : {"sand", "hard rock", "soft rock"}
+
+  Returns
+  -------
+  dist_km : ndarray, shape (nSOI,)
+    Great-circle distances of SOI centers, in km.
+  thickness_primary : ndarray, shape (nSOI,)
+    Primary ejecta thickness per SOI, in m.
+  thickness_local : ndarray, shape (nSOI,)
+    Excavation thickness of local target material due to secondary craters, in m.
+  thickness_total : ndarray, shape (nSOI,)
+    Sum of primary ejecta + local excavation thickness, in m.
+  """
+  ### //Initialize the ejecta model parameters// ###
+  # Define the ejecta model object, if needed
+  if ejecta_model is None:
+    ejecta_model = EjectaModel()
+  elif isinstance(ejecta_model, dict):
+    ejecta_model = EjectaModel(**ejecta_model)
+  else:
+    if not isinstance(ejecta_model, EjectaModel):
+      raise ValueError("`ejecta_model` must be either a dict of parameters or an instance of EjectaModel.")
+  # Extract parameters from the ejecta model object
+  theta0 = ejecta_model.theta0
+  rho_e  = ejecta_model.rho_e
+  rho_t  = ejecta_model.rho_t
+  b      = ejecta_model.b
+  cov    = ejecta_model.cov
+  R0     = ejecta_model.R0
+  g      = ejecta_model.g
+  R_sc   = ejecta_model.R_sc
+  C_mh   = ejecta_model.C_mh
+  b_mt   = ejecta_model.b_mt
+  b_v    = ejecta_model.b_v
+  K1     = ejecta_model.K1
+  nu     = ejecta_model.nu
+  mu     = ejecta_model.mu
+  Y      = ejecta_model.Y
+  
+  ### //Read in basin parameters// ###
+  # Present-day rim radius of basin
+  R_km = ds_basin.R.item()
+  R_m  = R_km * 1e3
+  # Apparent transient radius of basin
+  Rat_km = ds_basin.Rat.item()
+  if (Rat_km is None) or (not np.isfinite(Rat_km)):
+    # Empirical relationship derived from D's of Neumann et al. (2015), Dat's of
+    # Miljković et al. (2016), and SPA Dat from Rajšić (2025, personal communication)
+    x1_temp, x0_temp = [0.38, 38.18] #empirical relationship INCLUDING SPA
+    Rat_km = x1_temp*R_km + x0_temp
+    del x1_temp, x0_temp
+  Rat_m = Rat_km * 1e3
+  # Transient rim radius of basin
+  Rt_km = Rat_km * 1.2
+  Rt_m  = Rt_km * 1e3
+  
+  ### //Set up distance array// ###
+  # Set lower distance bound based on `R` and `Rat`
+  min_dist = R_km #ejecta is deposited beginning roughly at R [loose interpretation of reference to Melosh (1989) in Xie et al. (2020) Section 2.1.2]
+  safe_eps = 1e-3 #small epsilon to avoid numerical issues near `Rat`
+  min_dist_safe = ( 0.5 * (1 + np.sqrt(1 + 4*Rat_km)) )**2 + safe_eps #minimum distance at which the innermost SOI boundary abutts Rat -- anything smaller leads to an undefined velocity and ejecta thickness
+  if min_dist < min_dist_safe:
+    warnings.warn(f"\n'{ds_basin.basin.item()}' (R = {R_km:.2f} km) has Rat ({Rat_km:.2f} km) that is too large to use R as minimum distance. Adjusting to minimum safe distance of {min_dist_safe:.2f} km.\nNote that this will accentuate {ds_basin.basin.item()}'s innermost ejecta thickness compared to other basins.\n")
+    min_dist = min_dist_safe
+  # Set upper distance bound based on `radius_cutoff` argument
+  dist_limit = np.pi*(R0/1e3) * .99 #model yields errors very close to the antipode, so cut off profile just shy of π
+  if radius_cutoff is None:
+    max_dist = dist_limit
+  else:
+    max_dist = min([radius_cutoff*Rt_km, dist_limit])
+  # Generate distance array (each point is the great circle distance of center of a square of interest (SOI) from the basin center)
+  if rSOI is None:
+    dist_km = np.linspace(min_dist, max_dist, nSOI)
+    dist_m  = dist_km * 1e3
+  else:
+    if nSOI is not None:
+      warnings.warn("`rSOI` is set, so `nSOI` will be ignored.")
+    dist_km = np.asarray(rSOI)
+    if any(dist_km < min_dist) or any(dist_km > max_dist):
+      raise ValueError(f"All values in `rSOI` must be between {min_dist:.2f} km and {max_dist:.2f} km.")
+    dist_m  = dist_km * 1e3
+  
+  ### //Define size of each SOI -- Section 2.1.1 of Xie et al. (2020)// ###
+  soi_side_km  = 2 * np.sqrt(dist_km)                  #L_SOI [km]
+  soi_side_m   = soi_side_km * 1e3                     #L_SOI [m]
+  soi_area     = soi_side_m**2                         #S -- see text after Eq. 5 of Xie et al. (2020)
+
+  ### //Define velocity parameters for each SOI -- Eq. 1 of Xie et al. (2020)// ###
+  # Helper function (convert great circle distance to ejecta velocity at that distance)
+  _launch_offset = lambda d: d - Rat_m                 #R_s [see text above Eq. 1 of Xie et al. (2020)]
+  _X_term = lambda d: _launch_offset(d) / (2*R0)       #X [see text below Eq. 1]
+  _ejecta_velocity = lambda d: np.sqrt(R0*g*np.tan(_X_term(d))) / (np.sqrt( np.tan(_X_term(d))*np.cos(theta0)**2 + np.sin(theta0)*np.cos(theta0) )) #v(r_gc)
+  # Velocity parameters for each SOI
+  velocity_soi = _ejecta_velocity(dist_m)              #v(r_gc) -- velocity of primary ejecta in each SOI
+  vertical_velocity = velocity_soi * np.sin(theta0) #v_⊥ -- ground-perpendicular velocity
+  velocity_soi_e = velocity_soi**.38                   #v^0.38 -- see Eq. 16 of Xie et al. (2020)
+
+  ### //Define extents of SOIs// ###
+  # Helper function (convert great circle distance to distance on a flat target) -- Eq. 2 of Xie et al. (2020)
+  _flat_radius = lambda d: Rat_m + _ejecta_velocity(d)**2 * np.sin(2*theta0) / g #r(r_gc)
+  # Inner, outer, and mean radial distance of each SOI from the basin center -- see text after Eq. 3 of Xie et al. (2020)
+  inner_radius_gc = dist_m - (soi_side_m/2)            #r_gc [inner] -- great circle distance
+  inner_radius = _flat_radius(inner_radius_gc)         #r_inner -- flat target distance
+  outer_radius_gc = dist_m + (soi_side_m/2)            #r_gc [outer]
+  outer_radius = _flat_radius(outer_radius_gc)         #r_outer
+  mean_radius  = np.sqrt(inner_radius * outer_radius)  #r-bar -- geometric mean to account for spherical surface
+  # Area of basin-concentric ring that encompasses each SOI -- see text below Eq. 4 of Xie et al. (2020)
+  sphere_ring_area = 2*np.pi*(R0**2) * (np.cos(inner_radius_gc / R0) - np.cos(outer_radius_gc / R0)) #S_ring
+  flat_ring_area   = np.pi * (outer_radius**2 - inner_radius**2) #S_ring_flat
+  
+  ### //Calculate primary ejecta distribution -- Eqs. 4 & 5 of Xie et al. (2020)// ###
+  thickness_primary = (0.068 * Rat_m * (mean_radius / Rat_m)**(-3) * (flat_ring_area / sphere_ring_area)) #δ_SOI -- thickness of primary ejecta per SOI
+  mass_primary = thickness_primary * rho_e * soi_area  #M_SOI -- mass of primary ejecta per SOI
+  # Total mass of material ejected from primary transient crater -- see text below Eq. 7 of Xie et al. (2020))
+  total_mass_primary = 0.09 * rho_e * np.pi * Rat_m**3 #M_T
+  
+  ### //Largest secondary crater (LSC) parameters// ###
+  lsc_distance_m = (7.21 * Rat_km**0.94) * 1e3         #r_LSC -- Eq. 10 of Xie et al. (2020) [**this is only valid for complex and larger craters**]
+  velocity_lsc    = _ejecta_velocity(lsc_distance_m)   #v_LSC -- Eq. 8 of Xie et al. (2020)
+
+  ### //Fragment mass parameters// ###
+  # Upper and lower bounds on fragment mass -- see text below Eq. 7 of Xie et al. (2020)
+  mass_upper = np.full_like(velocity_soi, C_mh*(total_mass_primary**b_mt))
+  mask = velocity_soi >= velocity_lsc
+  mass_upper[mask] *= (velocity_soi[mask] / velocity_lsc)**(-b_v) #m_h
+  mass_lower = 1e-18 * mass_upper                      #m_l
+  # Empirical factor for fragment mass-frequency relationship -- Eq. 7 of Xie et al. (2020)
+  mass_norm_constant = mass_primary * (1 - b) / (b * (mass_upper**(1 - b) - mass_lower**(1 - b))) #C_SOI
+  
+  ### //Begin ballistic sedimentation model – compute thickness of local material mixed into total ejecta deposit// ###
+  # Define excavation scaling parameter C_ex from Xie et al. (2020)
+  C_ex = 3.5
+  # Pre-compute unchanging factors for SOI-loop calculations
+  pre_frag_radius = (3 / (4*np.pi*rho_e))**(1/3)
+  pre_sec_transient_radius1 = K1**(-(2+mu)/mu) * (g/vertical_velocity**2) * (rho_t/rho_e)**(2*nu/mu)
+  pre_sec_transient_radius2 = K1**(-(2+mu)/mu) * (Y/(rho_t*vertical_velocity**2))**((2+mu)/mu) * (rho_t/rho_e)**(nu*(2+mu)/mu)
+  exp_sec_transient_radius = -mu / (2+mu)
+  pre_central_effective_depth = C_ex * 0.0134 * velocity_soi_e
+
+  cache = {
+    # Scalars
+    'pre_frag_radius':             pre_frag_radius,
+    'exp_sec_transient_radius':    exp_sec_transient_radius,
+    # Arrays
+    'dist_km':                     dist_km,
+    'mass_lower':                  mass_lower,
+    'mass_upper':                  mass_upper,
+    'mass_norm_constant':          mass_norm_constant,
+    'soi_area':                    soi_area,
+    'thickness_primary':           thickness_primary,
+    'pre_sec_transient_radius1':   pre_sec_transient_radius1,
+    'pre_sec_transient_radius2':   pre_sec_transient_radius2,
+    'pre_central_effective_depth': pre_central_effective_depth,
+    # Objects
+    'ejecta_model':                ejecta_model
+  }
+  return cache
+
+
+def compute_central_effective_depth(                                 #d_eff (Eq. 17 of Xie et al. (2020))
+    m: float,
+    pre_frag_radius: float,
+    pre_sec1: float,
+    pre_sec2: float,
+    exp_sec_transient_radius: float,
+    pre_deff: float
+) -> float:
+  '''
+  Eq. 17 of Xie et al. (2020)
+  '''
+  a = pre_frag_radius * m**(1/3)
+  sec_transient_radius = a * (pre_sec1*a + pre_sec2)**(exp_sec_transient_radius)
+  return pre_deff * sec_transient_radius
+
+
+def compute_coverage_fraction(
+    T_LM: float,
+    ejecta_model: EjectaModel,
+    pre_frag_radius: float,
+    exp_sec_transient_radius: float,
+    ml: float,
+    mh: float,
+    C: float,
+    S: float,
+    pthick: float,
+    pre_sec1: float,
+    pre_sec2: float,
+    pre_deff: float,
+):
+  '''
+  Eq. 19 of Xie et al. (2020)
+  '''
+  b = ejecta_model.b
+
+  _central_effective_depth = functools.partial(
+    compute_central_effective_depth,
+    pre_frag_radius = pre_frag_radius,
+    pre_sec1 = pre_sec1,
+    pre_sec2 = pre_sec2,
+    exp_sec_transient_radius = exp_sec_transient_radius,
+    pre_deff = pre_deff
+  )
+  
+  deff_min = _central_effective_depth(ml) #d_eff for the smallest fragment mass
+  deff_max = _central_effective_depth(mh) #d_eff for the largest fragment mass
+  if T_LM <= deff_min: #maximum coverage case
+    m0 = ml
+  elif T_LM >= deff_max: #minimum coverage case
+    return 0
+  else:
+    sol = root_scalar(
+      lambda m: _central_effective_depth(m) - T_LM,
+      bracket=[ml, mh],
+      method='bisect'
+    )
+    m0 = sol.root
+  
+  def _f(m):
+    '''
+    Analytical equivalent of Riemann sum in Eq. 19 of Xie et al. (2020)
+    '''
+    a = pre_frag_radius * m**(1/3) # not using _central_effective_depth because we need R_at for `uncorrected_area`
+    R_at = a * (pre_sec1*a + pre_sec2)**(exp_sec_transient_radius)
+    d_eff = pre_deff * R_at
+    if pthick <= d_eff:                                              #1/N_layers * sum( ( (j-1)*δ_SOI / ( N_layers*C_ex*d_ex(R_at(m)) ) ) ) [analytical replacement]
+      correction2 = 1 - pthick/(2*d_eff)
+    else:
+      correction2 = d_eff/(2*pthick)
+    uncorrected_area = np.pi * R_at**2                               #S_PIS [uncorrected] -- π*R_at(m)^2
+    correction1 = max(0, 1-(T_LM/d_eff))                             #( 1 - T_LM/( C_ex*d_ex(R_at(m)) ) )
+    DN = C * b*m**(-b-1)                                             #ΔN [analytical replacement]
+    return uncorrected_area * correction1 * correction2 * DN / S
+  
+  def _f_log(x):
+    '''
+    Convert intermediate solution to logspace for numerical stability in integration
+    '''
+    m = np.exp(x)
+    return _f(m) * m
+  
+  integral = quad(_f_log, np.log(m0), np.log(mh), epsabs=0, epsrel=1e-2)[0]
+  W = 1 - np.exp(-integral)
+  return W                                                           #W(>T_LM)
+
+
 def compute_thickness_1D(
+  ds_basin: xr.Dataset,
+  nSOI: int = 20,
+  rSOI: float | list[float] = None,
+  radius_cutoff: float = None,
+  ejecta_model: dict | EjectaModel = None
+):
+  '''
+  
+  '''
+  cache = precompute_SOI(
+    ds_basin = ds_basin,
+    nSOI = nSOI,
+    rSOI = rSOI,
+    radius_cutoff = radius_cutoff,
+    ejecta_model = ejecta_model
+  )
+  ejecta_model = cache['ejecta_model']
+  dist_km = cache['dist_km']
+  thickness_primary = cache['thickness_primary']
+  thickness_local = np.zeros_like(dist_km)
+  for i in range(len(dist_km)):
+    _central_effective_depth_i = functools.partial(
+      compute_central_effective_depth,
+      pre_frag_radius = cache['pre_frag_radius'],
+      pre_sec1 = cache['pre_sec_transient_radius1'][i],
+      pre_sec2 = cache['pre_sec_transient_radius2'][i],
+      exp_sec_transient_radius = cache['exp_sec_transient_radius'],
+      pre_deff = cache['pre_central_effective_depth'][i],
+    )
+    _coverage_frac_i = functools.partial(
+      compute_coverage_fraction,
+      ejecta_model = ejecta_model,
+      pre_frag_radius = cache['pre_frag_radius'],
+      exp_sec_transient_radius = cache['exp_sec_transient_radius'],
+      ml = cache['mass_lower'][i],
+      mh = cache['mass_upper'][i],
+      C = cache['mass_norm_constant'][i],
+      S = cache['soi_area'][i],
+      pthick = thickness_primary[i],
+      pre_sec1 = cache['pre_sec_transient_radius1'][i],
+      pre_sec2 = cache['pre_sec_transient_radius2'][i],
+      pre_deff = cache['pre_central_effective_depth'][i],
+    )
+    if (_coverage_frac_i(0) <= ejecta_model.cov):
+      raise ValueError(f"Maximum coverage {_coverage_frac_i(0)} is not greater than `cov` ({ejecta_model.cov}) at distance {dist_km[i]:.2f} km; cannot compute local excavation thickness.")
+    Tmax = _central_effective_depth_i(cache['mass_upper'][i])
+    sol = root_scalar(
+      lambda T: _coverage_frac_i(T) - ejecta_model.cov,
+      bracket=[0, Tmax],
+      method='bisect'
+    )
+    thickness_local[i] = sol.root                                    #T_LM_med
+  thickness_total = thickness_primary + thickness_local #T_ED_med [*median only if `cov=0.5] -- see text below Eq. 19
+  return dist_km, thickness_primary, thickness_local, thickness_total
+
+
+# Analytical solution for ballistic sedimentation model of Xie et al. (2020)
+def compute_thickness_1D_OBSOLETE(
   ds_basin: xr.Dataset,
   theta_0: float = 45,
   rho_e: float = 3000,
@@ -88,7 +520,7 @@ def compute_thickness_1D(
   nSOI : int
     Number of radial bins (Squares of Interest) to compute.
   radius_cutoff : float or None
-    If set, maximum distance = radius_cutoff × Rt_km.
+    If set, maximum distance = radius_cutoff * Rt_km.
   C_mh, b_mt, b_v : float
     Parameters controlling upper/lower fragment-mass scalings (see below Eq. 7 of Xie et al. (2020)).
   material : {"sand", "hard rock", "soft rock"}
@@ -137,7 +569,6 @@ def compute_thickness_1D(
   if (Rat_km is None) or (not np.isfinite(Rat_km)):
     # Empirical relationship derived from D's of Neumann et al. (2015), Dat's of
     # Miljković et al. (2016), and SPA Dat from Rajšić (2025, personal communication)
-#     x1_temp, x0_temp = [0.37, 39.74] #empirical relationship EXCLUDING SPA
     x1_temp, x0_temp = [0.38, 38.18] #empirical relationship INCLUDING SPA
     Rat_km = x1_temp*R_km + x0_temp
     del x1_temp, x0_temp
@@ -245,8 +676,8 @@ def compute_thickness_1D(
       Eq. 19 of Xie et al. (2020)
       '''
       # Compute the mass where d_eff(m) == T_LM or select the upper/lower mass bound
-      deff_min = _central_effective_depth_i(ml_i) #effective depth for the smallest fragment mass
-      deff_max = _central_effective_depth_i(mh_i) #effective depth for the largest fragment mass
+      deff_min = _central_effective_depth_i(ml_i) #d_eff for the smallest fragment mass
+      deff_max = _central_effective_depth_i(mh_i) #d_eff for the largest fragment mass
       if T_LM <= deff_min: #maximum coverage case
         m0 = ml_i
       elif T_LM >= deff_max: #zero coverage case
@@ -267,13 +698,13 @@ def compute_thickness_1D(
         a = pre_frag_radius * m**(1/3)
         R_at = a * (pre_sec1_i*a + pre_sec2_i)**(exp_sec_transient_radius)
         d_eff = pre_deff_i * R_at
-        if pthick_i <= d_eff:                                       #1/N_layers * sum( ( (j-1)*δ_SOI / ( N_layers*C_ex*d_ex(R_at(m)) ) ) )
+        if pthick_i <= d_eff:                                        #1/N_layers * sum( ( (j-1)*δ_SOI / ( N_layers*C_ex*d_ex(R_at(m)) ) ) ) [analytical replacement]
           correction2 = 1 - pthick_i/(2*d_eff)
         else:
           correction2 = d_eff/(2*pthick_i)
         uncorrected_area = np.pi * R_at**2                           #S_PIS [uncorrected] -- π*R_at(m)^2
         correction1 = max(0, 1-(T_LM/d_eff))                         #( 1 - T_LM/( C_ex*d_ex(R_at(m)) ) )
-        DN = C_i * b*m**(-b-1)                                       #ΔN
+        DN = C_i * b*m**(-b-1)                                       #ΔN [analytical replacement]
         return uncorrected_area * correction1 * correction2 * DN / S_i
       
       def _f_log(x):
@@ -285,7 +716,7 @@ def compute_thickness_1D(
       
       integral = quad(_f_log, np.log(m0), np.log(mh_i), epsabs=0, epsrel=1e-2)[0]
       W = 1 - np.exp(-integral)
-      return W                                                      #W(>T_LM)
+      return W                                                       #W(>T_LM)
     
     if (_coverage_frac_i(0) <= cov): raise ValueError(f"Maximum coverage {_coverage_frac_i(0)} is not greater than `cov` ({cov}).")
     Tmax = _central_effective_depth_i(mh_i) # using max possible excavation depth as upper bound for T_LM -- this is the maximum thickness of local material that could be excavated by any fragment mass in this SOI
