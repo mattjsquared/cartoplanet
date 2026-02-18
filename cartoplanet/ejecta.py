@@ -44,6 +44,307 @@ def great_circle_distance(lat1, lon1, lat2, lon2, R=config.getfloat(body, "R0")/
   return 2 * R * np.arcsin(np.sqrt(a))
 
 
+def compute_ejecta_thickness_and_mixing_xarray(
+    Rat: float,
+    r_soi_center: float,
+    elevation: np.ndarray,
+    abundances: np.ndarray = None,
+    T_Rat: float = None,
+    bt: float = 3,
+    theta_degree: float = 45,
+    Y: float = 10e6,
+    K1: float = 1.03,
+    mu: float = 0.41,
+    nu: float = 0.4,
+    R0: float = 1737.4,
+    g: float = 1.622,
+    Dsc: float = 19,
+    mixing: bool = True,
+    return_secondary: bool = False,
+):
+  """
+  The code of the ballistic sedimentation model of Xie et al. (2020):
+  Xie, M., T. Liu, and A. Xu (2020), Ballistic sedimentation of impact crater ejecta: Implications for resurfacing and the provenance of lunar samples. Journal of Geophysical Research: Planets, 125, e2019JE006113. https://doi.org/10.1029/2019JE006113.
+
+  Originally created with MATLAB R2016b: 
+  Xie, M. Liu, T. and Xu, A. (2020), Ballistic sedimentaiton model [Code], Zenodo. https://doi.org/10.5281/zenodo.3692887.
+
+  Adapted to Python by Matt Jones 2026.
+
+  Parameters
+  ----------
+  Rat : float
+    The apparent radius of a transient crater at preimpact surface in kilometers.
+  r_soi_center : float
+    The great-circle distance from SOI center to the parent crater center in kilometers.
+  elevation : ndarray or list of float
+    Depth from the surface of pre-existing local material. Note that local material often consists of earlier basin ejecta and pre-basin materials
+  abundances : ndarray or list of float, optional
+    The abundance of previously emplaced crater ejecta in ejecta deposits versus depth from the surface of the ejecta deposits. The ejecta deposits are the pre-existing local material for the emplacement of the ejecta of the current crater of interest for the earliest crater, abundances should be an empty array.
+  T_Rat : float, optional
+    The thickness of ejecta at Rat with default value of T_Rat=0.068Rat.
+  bt : float, optional
+    The power-law index of ejecta thickness distribution with default value of bt=3.
+  theta_degree : float, optional
+    The launch/impact angle of ejecta in degrees with default value of theta_degree=45.
+  Y : float, optional
+    The strength of target material.
+  K1, mu, nu : float, optional
+    Constants in crater scaling laws (Equation 12 see also Table 2).
+  R0 : float, optional
+    The radius of the target body in kilometers (default is the mean radius of the Moon).
+  g : float, optional
+    The gravitational acceleration of the target body in m/s^2 (default is the Moon's gravity).
+  Dsc : float, optional
+    The simple-to-complex crater transition diameter in km (default is 19 km for the Moon).
+  mixing : bool, optional
+    Whether to compute the mixing of ejecta with local material. If False, the abundance of ejecta in ejecta deposits is not updated by mixing and the abundance of ejecta in ejecta deposits is the same as the abundance of ejecta in excavated ejecta deposits. Default is True.
+  return_secondary : bool, optional
+    Whether to return the information of secondary craters. Default is False.
+  
+  Returns
+  -------
+  Tlocal_med : 
+    The median thickness of excavated local material.
+  Tprimary : 
+    The thickness of primary ejecta.
+  new_abundances : 
+    The abundance of ejecta in ejecta deposits as a function of depth (i.e., `elevation`).
+  secondary_craters : 
+    A struct recording the information of secondary craters.
+  fraction_excavated : 
+    Fraction of excavated local material as a function of depth (i.e., `elevation`).
+  """
+  ### //Standardize inputs//
+  secondary_craters = {}
+  r_soi_center = np.asarray(r_soi_center)
+  elevation    = np.asarray(elevation)
+  abundances   = np.asarray(abundances)
+  Dsc = Dsc * 1000 #m, simple to complex transition diameter -- Xie et al. (2020) (from Pike (1980) LPSC, p27)
+  ### //Define helper function for converting apparent diameter to final diameter//
+  def Dat2D(Dat_m=None):
+    #D_m,in meters,final diameter
+    #Dat_m,in meters,apparent diameter
+    if Dat_m is None:
+      Dat_m = np.logspace(3, 5, 1000)
+    D_m   = Dat_m * 1.43
+    index = D_m > Dsc
+    D_m[index] = 1.52 * Dsc**(-0.18) * Dat_m[index]**1.18
+    return D_m
+  ### //Define interpolation helper function//
+  def safe_interp(x, xp, fp):
+    result = np.interp(x, xp, fp)
+    if any(x > 1 for x in result) or any(x < 0 for x in result):
+      raise ValueError("Interpolation error: Unexpected extrapolation, or data values are not between 0 and 1.")
+    return result
+  ### //Set parameters//
+  if T_Rat is None:
+    T_Rat     = 0.068 * Rat
+  Cex         = 3.5
+  rhot        = 3e6                                                                   #target density  g/m**3
+  rhoe        = rhot                                                                  #ejecta density  g/m**3
+  L_soi       = 2 * r_soi_center**0.5                                                 #km
+  launch_position = Rat                                                               #km
+  S_soi       = L_soi**2                                                              #km**2
+  g_km        = g / 1000                                                              #km/s**2
+  theta       = np.radians(theta_degree)
+  Cmh         = 0.013
+  b_Mtot      = 0.91
+  # Coefficients in Equation (10) derived from the work of Allen (1979).
+  a_rLSC      = 7.209219501948585
+  b_rLSC      = 0.935213298326370
+  # SOI characteristics
+  N_soi       = len(r_soi_center)                                                     #number of SOI
+  r_soi_outer = r_soi_center + L_soi/2                                                #km, the outer boundary of the SOI
+  r_soi_inner = r_soi_center - L_soi/2                                                #km, the inner boundary of the SOI
+  # Surface area of the SOI ring accounting for spherical target (Equation (4))
+  S_ring      = 2*np.pi * (R0**2) * (np.cos(r_soi_inner/R0) - np.cos(r_soi_outer/R0)) #km2
+  S_ring      = abs(S_ring)                                                           #if r_soi_outer/R0 > np.pi, S_ring < 0 -- this is a notable simplification
+  ### //Initialize outputs//
+  if not abundances.size:
+    m_depth        = len(elevation)
+    n_component    = 1                                                   #the total number of ejecta sources.
+    abundances     = np.zeros((m_depth, n_component, N_soi))             #[depth, component, SOI]
+    new_abundances = np.zeros(abundances.shape)
+  else:
+    abundances     = np.atleast_3d(abundances)                           #[depth, component, SOI]
+    m_depth, n_component, k = abundances.shape                           #the total number of differently sourced ejecta in local material.
+    n_component   += 1                                                   #we add one more component for the ejecta of the current crater of interest
+    new_component  = np.zeros((m_depth, 1, k))                           #initialize new abundances to zero
+    abundances     = np.concatenate((abundances, new_component), axis=1) #[depth, component, SOI]
+    new_abundances = np.zeros(abundances.shape)
+  idx_newcomponent = n_component - 1                                     #the index of the component for the ejecta of the current crater of interest in the `abundances` array
+  Tlocal_med         = np.zeros(r_soi_center.shape) #m -- median local material thickness
+  Tprimary           = np.zeros(r_soi_center.shape) #m -- primary ejecta thickness
+  fraction_excavated = np.zeros((len(elevation), N_soi))
+  if return_secondary:
+    if not mixing:
+      raise ValueError("`mixing` must be True to return secondary crater information..")
+    for key in ['D', 'largest', 'S_SOI', 'S_ring', 'density', 'density_cumulative', 'Num_SOI', 'Num_SOI_cumulative']:
+      secondary_craters[key] = np.empty(N_soi, dtype=object)
+  ### //Begin SOI loop//
+  for i_soi in range(N_soi):
+    ### //----------DEPOSIT THICKNESS----------//
+    if r_soi_center[i_soi] <= (Rat + L_soi[i_soi]/2):
+      raise ValueError("SOI must be outside crater rim.\n\n")
+    ### //Define ballistic distance-to-velocity function and values//
+    f_Rs         = lambda r_gc: r_gc - launch_position
+    f_X          = lambda r_gc: f_Rs(r_gc) / (2 * R0)
+    rgc2velocity = lambda r_gc: np.sqrt(  R0*g_km*np.tan(f_X(r_gc)) / (np.tan(f_X(r_gc))*np.cos(theta)**2 + np.sin(theta)*np.cos(theta))  )
+    v_soi_inner  = rgc2velocity(r_soi_inner[i_soi])                           #km/s
+    v_soi_outer  = rgc2velocity(r_soi_outer[i_soi])                           #km/s
+    v_soi_center = rgc2velocity(r_soi_center[i_soi])                          #km/s
+    # [??? from Xie et al. (2020) code -- not sure of the motivation here]
+    if v_soi_center >= 2.38:
+      Tprimary[i_soi]   = 0
+      Tlocal_med[i_soi] = 0
+      continue
+    # Convert to flat-surface approximation
+    v2r_flat             = lambda v: launch_position + v**2 * np.sin(2*theta) / (g_km)
+    r_soi_inner_flat     = v2r_flat(v_soi_inner)                               #km
+    r_soi_outer_flat     = v2r_flat(v_soi_outer)                               #km
+    r_soi_center_flat    = v2r_flat(v_soi_center)                              #km
+    S_ring_flat          = np.pi * (r_soi_outer_flat**2 - r_soi_inner_flat**2) #km**2
+    ### //Calculate primary ejecta thickness (Equation 4)//
+    Thickness_flat    = T_Rat * (r_soi_center_flat / Rat)**(-bt)     #km, the thickness of ejecta on flat surface at distance r_soi_center_flat
+    Thickness_SOI_km  = Thickness_flat * S_ring_flat / S_ring[i_soi] #km
+    Tprimary[i_soi]   = Thickness_SOI_km * 1000                      #m
+    # Mass of primary ejecta (Equation 5)
+    M_soi = rhoe * Tprimary[i_soi] * S_soi[i_soi] * 1e6              #g
+    ### //Calculate position and velocity of largest secondary crater (Equation 8)//
+    r_LSC = a_rLSC * Rat**b_rLSC
+    v_LSC = rgc2velocity(r_LSC) #km/s
+    ### //Scaling for primary ejecta fragment mass bounds (Equation 7)//
+    M_tot = 0.09 * np.pi * rhot * (Rat*1000)**3               #g
+    if v_soi_center >= v_LSC:
+      mh = Cmh * M_tot**b_Mtot * (v_soi_center/v_LSC)**(-5.7) #g, upper limit of ejecta mass
+    else:
+      mh = Cmh * M_tot**b_Mtot                                #g, upper limit of ejecta mass
+    b  = 0.98
+    ml = mh * 1e-23                                           #lower limit of ejecta mass
+    C_soi = M_soi * (1-b)/b / (mh**(1-b) - ml**(1-b))
+    if C_soi < 0:
+      raise ValueError("C_soi < 0\n\n")
+    ### //Compute discrete mass bins//
+    N_massbins = round(np.log(mh/ml) / np.log(1.05)) - 1 #mh=ml*q**(n+1) => n=log(mh/ml)/log(q)-1, q=1.05
+    mL = np.logspace(np.log10(ml), np.log10(mh), N_massbins+1)
+    mR = mL[1:]                                          #right boundary of mass bin.
+    mL = mL[:-1]                                         #left boundary of mass bin.
+    mass = (mL * mR)**0.5                                #g
+    N_ejecta = C_soi*mL**(-b) - C_soi*mR**(-b)           #number of ejecta framents in each mass bin.
+    ### //Scaling for characteristic secondary crater sizes//
+    Vp      = v_soi_center * 1000 * np.sin(theta)                                                                                            #m/s, vertical component
+    Vp2     = Vp**2
+    ai      = ((3 * mass) / (4 * np.pi * rhoe))**(1/3)                                                                                       #m,radius of projectile
+    Rat_sec = K1 * ai * (  (g*ai/Vp2) * (rhot/rhoe)**(2*nu/mu) + (Y/(rhot*Vp2))**(1+mu/2) * (rhot/rhoe)**(nu*(2+mu)/mu)  )**(-mu / (2 + mu)) #m
+    Dat     = Rat_sec * 2
+    D_secondary = Dat2D(Dat)
+    d_ex    = 0.0134 * Rat_sec * (v_soi_center * 1000)**0.38 # Equation (16)
+    ### //Initialize primary ejecta deposit layers//
+    Tprimary_perlayer     = max([Cex*d_ex[-1]/5000, Tprimary[i_soi]/100])                  #m
+    N_layers               = int(np.ceil(Tprimary[i_soi] / Tprimary_perlayer))
+    Tprimary_perlayer     = Tprimary[i_soi] / N_layers
+    if N_layers == 1:
+      elevation_layerbottoms = np.atleast_1d(0)
+    elif N_layers > 1:
+      elevation_layerbottoms = np.linspace(0, Tprimary[i_soi]-Tprimary_perlayer, N_layers) #the elevation of the lower boundary of a layer with respect to the surface of local material
+    else:
+      raise ValueError("N_layers should be a positive integer.")
+    ### //Compute thickness of local material excavated by secondary impacts (Equation 19)//
+    Tlocal_per_massbin = np.zeros(N_massbins)
+    coverage_exponent  = np.zeros((N_massbins, N_layers))            #the exponent in Equation 19
+    # Calculate density of secondary craters per layer of primary ejecta
+    S_secondary_craters       = np.pi * Rat_sec**2                   #m**2, the area of secondary craters at surface
+    density_secondary_craters = N_ejecta / S_soi[i_soi] * 1E-06      #m**-2, density of secondary craters
+    d_eff                     = Cex * d_ex                           #effective excavation depth.
+    density_SCs_onelayer      = density_secondary_craters / N_layers #m**-2,the density of secondary craters formed by a layer of ejecta
+    # Compute local material thickness added to deposit by each primary ejecta layer and mass bin
+    for k in range(N_layers):
+      for i in range(N_massbins):
+        ## TODO: Export these two lines out of the loop?
+        dmin  = d_ex[i] #the effective depth of the ith crater is dmin
+        Tlocal_per_massbin[i] = Cex * dmin
+        
+        index = np.arange(i, N_massbins)
+        index = index[(Tlocal_per_massbin[i] + elevation_layerbottoms[k]) < d_eff[index]]
+        S_pis = S_secondary_craters[index] * (1 - Tlocal_per_massbin[i]/d_eff[index]) * (1 - elevation_layerbottoms[k]/d_eff[index])
+        coverage_exponent[i, k] += sum(S_pis * density_SCs_onelayer[index])
+    ### //Compute fractional areal coverage of local material excavation for each mass bin//
+    coverage_exponent            = -np.cumsum(coverage_exponent, 1)
+    W_PIS_nLayers                = 1 - np.exp(coverage_exponent)                                                #[all mass bins, all layers] -- Equation 19
+    if any(x > 1 for x in W_PIS_nLayers.ravel()) or any(x < 0 for x in W_PIS_nLayers.ravel()):
+      raise ValueError("Coverage fraction (W) should be between 0 and 1.")
+    W_PIS_allLayers              = W_PIS_nLayers[:, -1]                                                         #[all mass bins, final layer]
+    # Interpolate final W-with-depth onto `elevation` grid
+    fraction_excavated[:, i_soi] = np.interp(elevation, np.flip(-Tlocal_per_massbin), np.flip(W_PIS_allLayers)) #Figure 4a
+    ### //Determine median (W = 0.5) local material excavation depth//
+    Tlocal_med[i_soi]            = Tlocal_per_massbin[np.where(W_PIS_allLayers < 0.5)[0][0]]
+    ### //----------MIXING----------//
+    if not mixing:
+      continue
+    ### //Mixing depth information -- agnostic of surface elevation//
+    zmax_mixingzone      = max(d_eff)                                                              #maximum depth of mixing zone from the surface
+    elevation_mixingzone = np.arange(-Tprimary_perlayer/2, -zmax_mixingzone, -Tprimary_perlayer) #depth grid for mixing zone
+    dz_mixingzone        = elevation_mixingzone[0] - elevation_mixingzone[1]
+    ### //Construct W-with-depth kernel//
+    # Interpolate W-with-depth for one layer onto mixing zone grid
+    W_onelayer          = W_PIS_nLayers[:, 0]                  #[all mass bins, first layer]
+    Wmz_onelayer        = safe_interp(elevation_mixingzone, np.flip(-d_eff), np.flip(W_onelayer))
+    Texcavated_onelayer = np.sum(dz_mixingzone * Wmz_onelayer) #effective total thickness excavated by one layer of ejecta
+    ### //Actual depth information -- completed deposition//
+    elevation_toplayer    = Tprimary[i_soi] - (dz_mixingzone/2)                                           #elevation of the center of the top layer discretized by `dz_mixingzone`
+    n_depth_fill          = int(abs( elevation_toplayer / dz_mixingzone ))
+    elevation_deposit     = np.flip(  np.linspace(dz_mixingzone/2, elevation_toplayer, n_depth_fill+1)  ) #depth grid for the ejecta deposit only
+    elevation_mixinggrid  = np.concatenate((elevation_deposit, elevation_mixingzone), axis=0)             #elevations from top of ejecta deposit to depth of `zmax_mixingzone` with uniform grid spacing
+    abundances_mixinggrid = np.zeros((len(elevation_mixinggrid), n_component))
+    ### //Mixing computation -- note that excavated materials could be ejecta deposits formed by earlier ejecta and/or local material//
+    for i in range(N_layers):
+      surface_elevation = elevation_layerbottoms[i]
+      # Set up reference indices for the layer of ejecta being deposited and compute first mixing step
+      if i == 0:
+        idx_mixingelevations  = np.where( (elevation_mixinggrid>(surface_elevation-zmax_mixingzone)) & (elevation_mixinggrid<surface_elevation) )[0] #select elevations for deposit i's mixing zone
+        idx_mixingdepths      = np.floor((surface_elevation - elevation_mixinggrid[idx_mixingelevations]) / dz_mixingzone).astype(int)               #map elevations in the mixing zone to layer indices for Wmz_onelayer -- TODO: this should be invariant, no? like, shouldn't this always just be equivalent to `range(len(Wmz_onelayer))`?
+        # Interpolate preexisting components' abundances onto the mixing grid
+        for j in range(0, n_component-1):
+          abundances_mixinggrid[idx_mixingelevations, j] = safe_interp(elevation_mixinggrid[idx_mixingelevations], np.flip(elevation), np.flip(abundances[:, j, i_soi]))
+      else:
+        idx_mixingelevations -= 1
+      # Calculate the fraction of primary ejecta in the layer being deposited (including materials excavated from earlier deposits)
+      Tprimary_excavated                                                 = sum(dz_mixingzone * abundances_mixinggrid[idx_mixingelevations, idx_newcomponent] * Wmz_onelayer[idx_mixingdepths]) #ejecta in excavated ejecta deposits
+      abundance_primary_thislayer                                        = (Tprimary_perlayer + Tprimary_excavated) / (Tprimary_perlayer + Texcavated_onelayer)
+      # Each layer's new primary ejecta abundance is now the weighted average of (1) non-excavated material from that layer and (2) the homogenized current deposit (`abundance_primary_thislayer`) that fills in holes
+      abundances_mixinggrid[idx_mixingelevations,      idx_newcomponent] = abundances_mixinggrid[idx_mixingelevations, idx_newcomponent]*(1-Wmz_onelayer[idx_mixingdepths]) + abundance_primary_thislayer*Wmz_onelayer[idx_mixingdepths]
+      abundances_mixinggrid[idx_mixingelevations[0]-1, idx_newcomponent] = abundance_primary_thislayer                                                                   #deposit the current layer
+      for k in range(n_component-1): #the jth component reworks preexisting materials, reducing the abundance of preexisting materials in ejecta deposits
+        # Calculate the fraction of component k in the layer being deposited (excavated from earlier deposits and/or beneath pre-impact surface)
+        Tk_excavated                                                     = sum(dz_mixingzone * abundances_mixinggrid[idx_mixingelevations, k] * Wmz_onelayer[idx_mixingdepths]) #ejecta in excavated ejecta deposits
+        abundance_k_thislayer                                            = Tk_excavated / (Texcavated_onelayer + Tprimary_perlayer)
+        # Each layer's new component k abundance is now the weighted average of (1) non-excavated material from that layer and (2) the homogenized current deposit (`abundance_k_thislayer`) that fills in holes
+        abundances_mixinggrid[idx_mixingelevations,      k]              = abundances_mixinggrid[idx_mixingelevations,      k]*(1-Wmz_onelayer[idx_mixingdepths]) + abundance_k_thislayer*Wmz_onelayer[idx_mixingdepths]
+        abundances_mixinggrid[idx_mixingelevations[0]-1, k]              = abundances_mixinggrid[idx_mixingelevations[0]-1, k] + abundance_k_thislayer
+    ### //Interpolate new abundances onto new elevation grid that includes the deposit//
+    ## TODO: Hmm... this should probably include extrapolation?
+    elevation_afterdeposit       = np.concatenate((np.flip(elevation_layerbottoms)+Tprimary_perlayer/2, elevation), axis=0) #new elevation grid that includes the deposit
+    new_abundances_afterdeposit         = np.zeros((len(elevation_afterdeposit), n_component))
+    for j in range(n_component):
+      new_abundances_afterdeposit[:, j] = safe_interp(elevation_afterdeposit, np.flip(elevation_mixinggrid), np.flip(abundances_mixinggrid[:, j]))
+    ### //Interpolate new abundances onto original elevation grid for output//
+    for k in range(n_component):
+      new_abundances[:, k, i_soi]    = np.interp(elevation, np.flip(elevation_afterdeposit-Tprimary[i_soi]), np.flip(new_abundances_afterdeposit[:, k]))
+    ### //Record secondary crater information//
+    if return_secondary:
+      secondary_craters['D'][i_soi]                  = D_secondary             #m
+      secondary_craters['largest'][i_soi]            = D_secondary[-1]         #m
+      secondary_craters['S_SOI'][i_soi]              = S_soi[i_soi]            #km**2
+      secondary_craters['S_ring'][i_soi]             = S_ring[i_soi]           #km**2
+      secondary_craters['density'][i_soi]            = N_ejecta / S_soi[i_soi] #km**-2
+      secondary_craters['density_cumulative'][i_soi] = np.flip(np.cumsum(np.flip(secondary_craters['density'][i_soi])))
+      secondary_craters['Num_SOI'][i_soi]            = N_ejecta
+      secondary_craters['Num_SOI_cumulative'][i_soi] = np.flip(np.cumsum(np.flip(secondary_craters['Num_SOI'][i_soi])))
+  ### //End SOI loop//
+  return Tlocal_med, Tprimary, new_abundances, secondary_craters, fraction_excavated
+
+
 def compute_ejecta_thickness_and_mixing(
     Rat,
     r_SOI_center,
@@ -349,8 +650,8 @@ def compute_ejecta_thickness_and_mixing(
   return T_LM_med, T_PE, abundance_PEinNewED, secondary_craters, Fraction_ExcavatedLM
 
 
-def ballistic_sedimentation_Xie(
-    df_basin: pd.DataFrame,
+def ballistic_sedimentation_Xie_xarray(
+    xr_basin: xr.Dataset,
     r_SOI: np.ndarray = None,
     coord_SOI: np.ndarray = None,
     dz: float = 0.05,
@@ -392,7 +693,51 @@ def ballistic_sedimentation_Xie(
   return T_LM_med, T_PE, abundance_PEinNewED, secondary_craters, Fraction_ExcavatedLM, elevation, abundance_PEinED_withoutMixingbyLaterEjecta
 
 
-def Xie_figure10c():
+def ballistic_sedimentation_Xie(
+    df_basin: pd.DataFrame,
+    r_SOI: np.ndarray = None,
+    coord_SOI: np.ndarray = None,
+    dz: float = 0.05,
+    max_depth: float = 1e4,
+    R0: float = 1737.4,
+    **kw_args
+) -> tuple:
+  """
+  
+  """
+  if r_SOI is None and coord_SOI is None:
+    raise ValueError("Either r_SOI or coord_SOI must be provided.")
+  elif r_SOI is not None and coord_SOI is not None:
+    raise ValueError("Only one of r_SOI or coord_SOI should be provided.")
+  nsteps_Elevation = int(max_depth / dz) + 1
+  elevation = np.linspace(dz/2, -max_depth+(dz/2), nsteps_Elevation)
+  coord_basin = df_basin[['lat', 'lon']].values
+  Rat = df_basin['Rat'].values
+  if coord_SOI is not None:
+    r_SOI = []
+    for c in coord_SOI:
+      r_SOI.append(great_circle_distance(c[0], c[1], coord_basin[:, 0], coord_basin[:, 1], R=R0))
+    r_SOI = np.asarray(r_SOI)
+  T_LM_med                                    = np.zeros((len(Rat), r_SOI.shape[0]))
+  T_PE                                        = np.zeros((len(Rat), r_SOI.shape[0]))
+  abundance_PEinNewED = []
+  secondary_craters                           = np.empty(len(Rat), dtype=object)
+  Fraction_ExcavatedLM                        = np.zeros((len(elevation), len(Rat), r_SOI.shape[0]))
+  abundance_PEinED_withoutMixingbyLaterEjecta = np.zeros((len(elevation), len(Rat), r_SOI.shape[0]))
+  for i in tqdm(range(len(Rat)), desc="Running ballistic sedimentation model for each basin"):
+    # T_LM_med[i], T_PE[i], abundance_PEinNewED, secondary_craters[i], Fraction_ExcavatedLM[:, i, :] = compute_ejecta_thickness_and_mixing(
+    T_LM_med[i], T_PE[i], abundance_PEinNewED, secondary_craters[i], Fraction_ExcavatedLM[:, i, :] = compute_ejecta_thickness_and_mixing_xarray(
+        Rat=Rat[i],
+        r_soi_center=r_SOI[:, i],
+        elevation=elevation,
+        abundances=abundance_PEinNewED,
+        **kw_args
+    )
+    abundance_PEinED_withoutMixingbyLaterEjecta[:, i, :] = abundance_PEinNewED[:, -1, :]
+  return T_LM_med, T_PE, abundance_PEinNewED, secondary_craters, Fraction_ExcavatedLM, elevation, abundance_PEinED_withoutMixingbyLaterEjecta
+
+
+def Xie_figure10c() -> tuple:
   """
   Code to reproduce Figure 10c of Xie et al. (2020) using the ballistic sedimentation model of Xie et al. (2020):
   Xie, M., T. Liu, and A. Xu (2020), Ballistic sedimentation of impact crater ejecta: Implications for resurfacing and the provenance of lunar samples. Journal of Geophysical Research: Planets, 125, e2019JE006113. https://doi.org/10.1029/2019JE006113.
@@ -446,14 +791,14 @@ def Xie_figure10c():
     ax.set_xlim([0.1, 20000])
     ax.set_yticks([1, 2, 5, 10, 20, 50, 100], labels=['1', '2', '5', '10', '20', '50', '100'])
     ax.set_xlabel("Depth from surface (m)")
-    ax.set_ylabel("Abundance of basin ejecta in deposits (#)")
+    ax.set_ylabel("Abundance of basin ejecta in deposits (%)")
     ax.minorticks_on()
     ax.tick_params(axis='both', which='both', direction='in', top=True, right=True)
     plt.show()
-  return
+  return Tlm, Tpe, abundance_PEinED, secondary_craters, Fraction_ExcavatedLM, elevation, abundance_PEinED_withoutMixingbyLaterEjecta
 
 
-def Xie_figure5():
+def Xie_figure5() -> tuple:
   """
   Code to reproduce Figure 5 of Xie et al. (2020) using the ballistic sedimentation model of Xie et al. (2020):
   Xie, M., T. Liu, and A. Xu (2020), Ballistic sedimentation of impact crater ejecta: Implications for resurfacing and the provenance of lunar samples. Journal of Geophysical Research: Planets, 125, e2019JE006113. https://doi.org/10.1029/2019JE006113.
@@ -498,7 +843,7 @@ def Xie_figure5():
       a.minorticks_on()
       a.tick_params(which='both', direction='in', right=True, top=True)
     plt.show()
-  return
+  return Tlm, Tpe, abundance_PEinED, secondary_craters, Fraction_ExcavatedLM, elevation, abundance_PEinED_withoutMixingbyLaterEjecta
 
 
 class EjectaModel:
