@@ -11,11 +11,9 @@ from cartoplanet import config
 
 body = config['BODY']['body']
 
-DEBUG = True
 
 
-
-
+### General utility
 def great_circle_distance(lat1, lon1, lat2, lon2, R=config.getfloat(body, "R0")/1e3, in_degrees=True):
   """
   Compute great-circle distance on a sphere.
@@ -142,7 +140,6 @@ def Xie_figure5() -> tuple:
       a.set_yticks(np.linspace(0, 100, 11))
       a.minorticks_on()
       a.tick_params(which='both', direction='in', right=True, top=True)
-      a.grid()
     plt.show()
   return Tprimary, frac_excavatedlocal, abundances, elevation
 
@@ -162,6 +159,19 @@ def Xie_figure10c() -> tuple:
   basin_lats  = [-16.15, -24.28, 18.03, 26.57,  34.71, -19.83]
   basin_lons  = [ 34.59, -39.35, 60.12, 18.05, -17.07, -94.58]
   basin_Dats  = [339, 300, 370, 350, 402, 418]
+  ds_basin = xr.Dataset(
+    {
+      'order': (('basin'), range(len(basin_names))),
+      'clat': (('basin'), basin_lats),
+      'clon': (('basin'), basin_lons),
+      'Dat':  (('basin'), basin_Dats)
+    },
+    coords = {
+      'basin': basin_names
+    }
+  )
+  ds_basin = ds_basin.assign(Rat = lambda ds: ds['Dat'] / 2)
+  ds_basin = ds_basin.assign(R = lambda ds: ds['Rat'] * 1.3)
   coord_A16   = (-8.973, 15.5)
   ### //Initialize variables//
   # Elevation grid
@@ -177,28 +187,7 @@ def Xie_figure10c() -> tuple:
   abundances               = None
   abundances_without_later = np.zeros((len(elevation), n_basins))
   ### //Emplace basins chronologically//
-  for i in range(n_basins):
-    Rat_km = basin_Dats[i] / 2
-    # Build minimal xr.Dataset expected by precompute_SOI
-    ds = xr.Dataset({
-      'R':     Rat_km * 1.3,
-      'Rat':   Rat_km,
-      'basin': basin_names[i],
-    })
-    rSOI        = great_circle_distance(basin_lats[i], basin_lons[i], coord_A16[0], coord_A16[1])
-    cache       = precompute_SOI(ds, rSOI=[rSOI], ejecta_model=ejecta_model)
-    Tprimary[i] = cache['thickness_primary'][0]
-    kernel      = compute_mixing_kernel(cache, 0)
-    # Handle case of no primary ejecta, or compute mixing
-    if kernel is None:
-      if abundances is None:
-        abundances = np.zeros((len(elevation), 1))
-      else:
-        abundances = np.column_stack([abundances, np.zeros(len(elevation))])
-      continue
-    else:
-      abundances                     = compute_ejecta_mixing(kernel, elevation, abundances)
-      abundances_without_later[:, i] = abundances[:, -1]
+  ds_profile = compute_ejecta_mixing_multi_basin(ds_basin, coord_A16[0], coord_A16[1], elevation, ejecta_model, preimpact_label="Pre-Nectarian")
   ### //Plot//
   with plt.rc_context({
       'font.family': 'Myriad Pro',
@@ -206,36 +195,22 @@ def Xie_figure10c() -> tuple:
       'lines.linewidth': 1.5,
   }):
     fig, ax = plt.subplots(1, 1, figsize=(6.67, 4))
-    C1 = ['#ff0000', '#00ffff', '#0000ff', '#000000', '#ff00ff', '#00ff00']
+    C1 = ['#888888', '#ff0000', '#00ffff', '#0000ff', '#000000', '#ff00ff', '#00ff00']
     # Plot basins
-    for i in range(n_basins):
+    for i, b in enumerate(ds_profile['basin'].values):
+      basin = ds_profile.sel(basin=b)
       ax.loglog(
-        -elevation + sum(Tprimary[i+1:]),
-        abundances_without_later[:, i] * 100,
-        color = C1[i], 
+        -elevation + sum(ds_profile['primary_thickness'].values[i+1:]),
+        basin['abundance_iflast'].values * 100,
+        color = C1[i],
         linestyle = '--'
       )
       ax.loglog(
         -elevation,
-        abundances[:, i] * 100,
+        basin['abundance'].values * 100,
         color = C1[i]
       )
-      ax.text(1800, 7 * 2**(0.5 * i), basin_names[i], color=C1[i])
-    # Plot pre-Nectarian materials
-    abundance_PreNect = (1 - abundances_without_later[:, 0]) * 100
-    ax.loglog(
-      -elevation + sum(Tprimary[1:]),
-      abundance_PreNect,
-      linestyle = '--', 
-      color = [0.5, 0.5, 0.5]
-    )
-    abundance_PreNect = (1 - np.sum(abundances, axis=1)) * 100
-    ax.loglog(
-      -elevation,
-      abundance_PreNect,
-      color = [0.5, 0.5, 0.5]
-    )
-    ax.text(1800, 4, "Pre-Nectarian\nmaterials", color=[0.5, 0.5, 0.5])
+      ax.text(1800, 7 * 2**(0.5 * i), b, color=C1[i])
     # Formatting
     ax.set_ylim([0.1, 100])
     ax.set_xlim([0.1, 20000])
@@ -245,9 +220,10 @@ def Xie_figure10c() -> tuple:
     ax.minorticks_on()
     ax.tick_params(axis='both', which='both', direction='in', top=True, right=True)
     plt.show()
-  return Tprimary, abundances, abundances_without_later, elevation
+  return ds_profile
 
 
+### Backend for mass-continuous ballistic sedimentation
 class EjectaModel:
   def __init__(
     self,
@@ -666,6 +642,7 @@ def compute_coverage_fraction(
   return W                                                           #W(>T_LM)
 
 
+### Vertical mixing from ballistic sedimentation
 def compute_mixing_kernel(
     cache: dict,
     i_soi: int,
@@ -810,6 +787,12 @@ def compute_ejecta_mixing(
     Updated abundances after mixing.  The last column is the newly emplaced
     primary ejecta component.
   """
+  ### //Handle case of no primary ejecta, or compute mixing//
+  if kernel is None:
+    if abundances is None:
+      return np.zeros((len(elevation), 1))
+    else:
+      return np.column_stack([abundances, np.zeros(len(elevation))])
   ### //Fetch parameters from kernel//
   Tprimary               = kernel['primary_thickness']      #[m]
   Wmz_onelayer           = kernel['Wmz_onelayer']           #[area fraction]
@@ -870,6 +853,86 @@ def compute_ejecta_mixing(
   return new_abundances
 
 
+def compute_ejecta_mixing_multi_basin(
+    ds_basin: xr.Dataset,
+    profile_lat: float,
+    profile_lon: float,
+    elevation: np.ndarray = None,
+    ejecta_model: dict | EjectaModel = None,
+    preimpact_label: str = None
+) -> xr.Dataset:
+  """
+  
+
+  Parameters
+  ----------
+  ds_basin : xr.Dataset
+    Must contain dimensions:
+    - basin : name of each basin
+    and variables:
+    - order : stratigraphic order of each basin (ascending)
+    - clat  : latitude of each basin center (degrees)
+    - clon  : longitude of each basin center (degrees)
+    - R     : rim radius of each basin (km)
+    - Rat   : apparent transient radius of each basin (km)
+  profile_lat, profile_lon : float
+    Coordinates of the point at which to compute the vertical mixing profile.
+  elevation : optional, ndarray or None
+    Elevation grid in meters for the vertical mixing profile. If `None`, elevation grid will be handled automatically.
+  ejecta_model : dict or EjectaModel
+    If dict, can contain keys as described in the EjectaModel class. If `None`, default parameters from the EjectaModel class will be used.
+  preimpact_label : str, optional
+    Name for the mixing component corresponding to local materials that predate the first impact. If `None`, defaults to 'preimpact'..
+  
+  Returns
+  -------
+  ds_profile : xr.Dataset
+    Dataset containing the vertical mixing profile at the specified location, with dimensions:
+    - elevation : elevation of grid points w.r.t. pre-impact surface (m)
+    - basin     : name of each basin involved in mixing, plus "preimpact"
+    and variables:
+    - primary_thickness : thickness of primary ejecta from each basin at this location
+    - abundance : area or volume fraction of each basin's primary ejecta at each elevation
+    - abundance_iflast : area or volume fraction of each basin's primary ejecta at each elevation if there were no subsequent impacts
+  """
+  ### //Initialize the computation//
+  # Set up the elevation grid
+  if elevation is None:
+    dz        = 10                                            #[m]
+    max_elev  = 1e4                                           #[m]
+    max_depth = 1e4                                           #[m]
+    elevation = np.arange((max_elev - dz/2), -max_depth, -dz) #[m]
+  else:
+    elevation = np.asarray(elevation)                         #[m]
+  # Fetch the ordered list of basins
+  basins_ordered = ds_basin.sortby('order')['basin'].values
+  # Define the output dataset
+  pre_lbl = preimpact_label or 'preimpact'
+  ds_profile = xr.Dataset(
+    coords = {
+      'elevation': elevation,
+      'basin': np.concatenate(([pre_lbl], basins_ordered))
+    }
+  )
+  ### //Run the chronological vertical mixing//
+  Tprimary = [np.nan]
+  abundances = np.ones((len(elevation), 1))
+  abundances_iflast = np.ones_like(abundances)
+  for b in basins_ordered:
+    basin  = ds_basin.sel(basin=b)
+    rSOI   = great_circle_distance(profile_lat, profile_lon, basin.clat, basin.clon) #[km]
+    cache  = precompute_SOI(ds_basin=basin, rSOI=[rSOI], ejecta_model=ejecta_model)
+    kernel = compute_mixing_kernel(cache, 0)
+    Tprimary.append(kernel['primary_thickness'])
+    abundances = compute_ejecta_mixing(kernel, elevation, abundances)
+    abundances_iflast = np.concatenate((abundances_iflast, abundances[:, -1][:, None]), axis=1)
+  ds_profile['primary_thickness'] = (('basin',), Tprimary)
+  for var_name, var in zip(['abundance', 'abundance_iflast'], [abundances, abundances_iflast]):
+    ds_profile[var_name] = (('elevation', 'basin'), var)
+  return ds_profile
+
+
+### Compute 1D radial profiles of ejecta thickness
 def compute_thickness_1D(
   ds_basin: xr.Dataset,
   nSOI: int = 20,
