@@ -540,6 +540,89 @@ def compute_central_effective_depth(                                 #d_eff (Eq.
   return pre_deff * sec_transient_radius
 
 
+def compute_coverage_fraction_fast(
+    depths: np.ndarray,
+    ejecta_model: EjectaModel,
+    soi_cache: dict,
+    layer_mode: str = 'all',
+    nmass: int = 2048,
+) -> np.ndarray:
+  """
+  Fast vectorized approximation of Eq. 19 over an array of depths.
+  """
+  ### //Process inputs//
+  # Normalize parameters
+  if layer_mode not in ['all', 'one']:
+    raise ValueError("`layer_mode` must be 'all' [for coverage after full primary ejecta deposit is emplaced] or 'one' [for coverage after a single layer is emplaced].")
+  def _as_scalar(x, name):
+    arr = np.asarray(x)
+    if arr.ndim == 0:
+      return float(arr)
+    if arr.size == 1:
+      return float(arr.reshape(-1)[0])
+    raise ValueError(f"`{name}` must be a scalar (or size-1 array), got shape {arr.shape}.")
+  pre_frag_radius = _as_scalar(soi_cache['pre_frag_radius'], 'pre_frag_radius')
+  exp_sec_transient_radius = _as_scalar(soi_cache['exp_sec_transient_radius'], 'exp_sec_transient_radius')
+  ml = _as_scalar(soi_cache['mass_lower'], 'ml')
+  mh = _as_scalar(soi_cache['mass_upper'], 'mh')
+  C = _as_scalar(soi_cache['mass_norm_constant'], 'C')
+  S = _as_scalar(soi_cache['soi_area'], 'S')
+  pthick = _as_scalar(soi_cache['thickness_primary'], 'pthick')
+  pre_sec1 = _as_scalar(soi_cache['pre_sec_transient_radius1'], 'pre_sec1')
+  pre_sec2 = _as_scalar(soi_cache['pre_sec_transient_radius2'], 'pre_sec2')
+  pre_deff = _as_scalar(soi_cache['pre_central_effective_depth'], 'pre_deff')
+  if mh <= ml or C <= 0 or S <= 0:
+    raise ValueError("Invalid mass bounds, normalization constant, or SOI area in `soi_cache`.")
+  # Can't compute coverage fraction for negative depths, so set those to 0
+  depths = np.asarray(depths, dtype=float)
+  depths = np.maximum(depths, 0.0)
+  ### //Prepare for the vectorized integral//
+  # Calculate mass-discretized excavation depths
+  b = ejecta_model.b
+  mspace = np.logspace(np.log10(ml), np.log10(mh), int(nmass))
+  a = pre_frag_radius * mspace**(1/3)
+  R_at = a * (pre_sec1*a + pre_sec2)**(exp_sec_transient_radius)
+  deff = pre_deff * R_at
+  # Calculate pre-integral mass-discretized exponent of Eq. 19/20 of Xie et al. (2020)
+  area = np.pi * R_at**2
+  DN = C * b * mspace**(-b - 1)
+  if layer_mode == 'all':   #shielding effect for mass-continuous form of Eq. 19 of Xie et al. (2020)
+    if pthick == 0:
+      layer_correction = np.ones_like(deff)
+    elif pthick < 0:
+      raise ValueError("Primary ejecta thickness must be non-negative.")
+    else:
+      layer_correction = np.where(pthick <= deff, 1 - pthick/(2*deff), deff/(2*pthick))
+  elif layer_mode == 'one': #mass-continuous form of Eq. 20 of Xie et al. (2020)
+    deff_max = deff[-1]
+    Tprimary_perlayer = max(deff_max / 5000, pthick / 100)
+    N_layers = int(np.ceil(pthick / Tprimary_perlayer))
+    layer_correction = 1 / N_layers #this isn't technically a shielding correction — this just undoes the implicit sum over layers
+  base = area * layer_correction * DN / S
+  ### //Decompose the (1 - T_LM/d_eff) correction into two integrals to enable vectorization (designed and implemented by Claude Opus 4.6)//
+  # Compute cumulative integrals from ml to m for O(1) profile queries
+  I0_cum = cumulative_simpson(base, x=mspace, initial=0.0)        #integral of base * 1 (from (1 - T_LM/d_eff) term)
+  I1_cum = cumulative_simpson(base / deff, x=mspace, initial=0.0) #integral of base * 1/d_eff (from (1 - T_LM/d_eff) term)
+  I0_tot = I0_cum[-1]
+  I1_tot = I1_cum[-1]
+  # Interpolate cumulative integrals at m0 corresponding to each depth
+  deff_min = deff[0]
+  deff_max = deff[-1]
+  m0 = np.interp(depths, deff, mspace, left=ml, right=mh)
+  I0_lo = np.interp(m0, mspace, I0_cum)
+  I1_lo = np.interp(m0, mspace, I1_cum)
+  # Calculate the final integral
+  exponent = (I0_tot - I0_lo) - depths * (I1_tot - I1_lo) #reintroduce T_LM from the (1 - T_LM/d_eff) term
+  exponent = np.where(depths >= deff_max, 0.0, exponent) #clamp as if we used the `max(0, 1 - T_LM/d_eff)` check before integrating
+  shallow_exponent = I0_tot - depths * I1_tot
+  exponent = np.where(depths <= deff_min, shallow_exponent, exponent) #prevent floating-point issues from interpolation at small depths
+  ### //Return the coverage fraction at each depth//
+  W = 1 - np.exp(-exponent)
+  if any(W < 0) or any(W > 1):
+    raise ValueError("At least one coverage fraction is out of bounds (should be between 0 and 1).")
+  return W
+
+
 def compute_coverage_fraction(
     T_LM: float,
     ejecta_model: EjectaModel,
