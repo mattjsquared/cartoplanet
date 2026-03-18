@@ -11,8 +11,6 @@ from cartoplanet import config
 
 body = config['BODY']['body']
 
-TEST = True
-
 
 
 ### General utility
@@ -192,10 +190,7 @@ def Xie_figure10c(grid=False) -> tuple:
   dz        = 0.05
   max_depth = 1e4
   nz        = int(max_depth / dz) + 1
-  if TEST:
-    elevation = None
-  else:
-    elevation = np.linspace(dz/2, -max_depth + (dz/2), nz)
+  elevation = None
   # Ejecta model
   ejecta_model   = EjectaModel(material="sand")
   ejecta_model.Y = 10e6
@@ -203,9 +198,7 @@ def Xie_figure10c(grid=False) -> tuple:
   ds_profile = compute_ejecta_mixing_multi_basin(ds_basin, coord_A16[0], coord_A16[1], elevation, ejecta_model, preimpact_label="Pre-Nectarian")
   elevation = ds_profile['elevation'].values
   ### //Plot//
-  depth = -elevation
-  if TEST:
-    depth += ds_profile.attrs['Tprimary_total'].item()
+  depth = -elevation + ds_profile.attrs['Tprimary_total'].item()
   with plt.rc_context({
       'font.family': 'Myriad Pro',
       'figure.dpi': 300,
@@ -1025,20 +1018,14 @@ def compute_ejecta_mixing(
   n_depth_fill          = int(abs(elevation_toplayer / dz))
   elevation_deposit     = np.flip(np.linspace(dz / 2, elevation_toplayer, n_depth_fill + 1)) #[m]
   elevation_mixinggrid  = np.concatenate((elevation_deposit, mixing_grid))                   #[m]
-  if TEST:
-    # Correct grid for surface elevation
-    elevation_mixinggrid    += surface_elevation                                                        #[m]
-    elevation_initialsurface = surface_elevation                                                        #[m] -- elevation of the surface before any of this basin's ejecta is deposited
-  else:
-    elevation_initialsurface                 = elevation_layerbottoms[0]                          #[m] -- elevation of the surface before any of this basin's ejecta is deposited
+  # Correct grid for surface elevation
+  elevation_mixinggrid    += surface_elevation                                                        #[m]
+  elevation_initialsurface = surface_elevation                                                        #[m] -- elevation of the surface before any of this basin's ejecta is deposited
   ### //Initialize preexisting abundances on the mixing grid//
   idx_mixingzone                             = np.where((elevation_mixinggrid > (elevation_initialsurface - zmax)) & (elevation_mixinggrid < elevation_initialsurface))[0] #starting indices of the moving mixing-zone window for `elevation_mixinggrid`
   abundances_mixinggrid                      = np.zeros((len(elevation_mixinggrid), n_component)) #[area fraction]
   for k in range(idx_newcomponent): #initialize the first layer's mixing zone with preexisting abundances
-    if True:
-      abundances_mixinggrid[idx_mixingzone, k] = _safe_interp(elevation_mixinggrid[idx_mixingzone], np.flip(elevation), np.flip(abundances_2d[:, k]), right=0) #[area fraction] -- abundances of preexisting components within mixing zone for the first layer
-    else:
-      abundances_mixinggrid[idx_mixingzone, k] = _safe_interp(elevation_mixinggrid[idx_mixingzone], np.flip(elevation), np.flip(abundances_2d[:, k])) #[area fraction] -- abundances of preexisting components within mixing zone for the first layer
+    abundances_mixinggrid[idx_mixingzone, k] = _safe_interp(elevation_mixinggrid[idx_mixingzone], np.flip(elevation), np.flip(abundances_2d[:, k]), right=0) #[area fraction] -- abundances of preexisting components within mixing zone for the first layer
   ### //Compute vertical mixing//
   Wmz_col = Wmz_onelayer[:, None]                                                    #(n_mix, 1) for broadcasting
   for i in range(N_layers): #emplace primary ejecta layer-by-layer
@@ -1061,30 +1048,16 @@ def compute_ejecta_mixing(
   # Identify elevations outside the mixing zone where extrapolation would be invalid
   deep_mask      = elevation < np.min(elevation_mixinggrid) # below mixing zone on the original elevation grid
   new_abundances = np.zeros((len(elevation), n_component))  #[area fraction]
-  if TEST:
-    # Interpolate onto the original grid
-    deposit_top   = surface_elevation + Tprimary
-    above_deposit = elevation > deposit_top
-    for k in range(n_component):
-      new_abundances[:, k] = _safe_interp(elevation, np.flip(elevation_mixinggrid), np.flip(abundances_mixinggrid[:, k])) #[area fraction]
-      # Zero above the deposit top (where no material has been placed yet)
-      new_abundances[above_deposit, k] = 0.0
-      # Below the mixing zone, restore original abundances for preexisting components
-      if k < idx_newcomponent:
-        new_abundances[:, k] = np.where(deep_mask, abundances_2d[:, k], new_abundances[:, k])
-  else:
-    ## TODO: `elevation_afterdeposit` is currently susceptible to duplication/non-monotonicity
-    n_deposit               = len(elevation_layerbottoms)
-    elevation_afterdeposit  = np.concatenate((np.flip(elevation_layerbottoms) + Tprimary_onelayer/2, elevation)) #[m]
-    abundances_afterdeposit = np.zeros((len(elevation_afterdeposit), n_component))                               #[area fraction]
-    for k in range(n_component):
-      abundances_afterdeposit[:, k] = _safe_interp(elevation_afterdeposit, np.flip(elevation_mixinggrid), np.flip(abundances_mixinggrid[:, k]))   #[area fraction]
-      # Below the mixing zone, restore original abundances instead of extrapolating
-      if k < idx_newcomponent:
-        abundances_afterdeposit[n_deposit:, k] = np.where(deep_mask, abundances_2d[:, k], abundances_afterdeposit[n_deposit:, k])
-      else:
-        abundances_afterdeposit[n_deposit:, k] = np.where(deep_mask, 0.0, abundances_afterdeposit[n_deposit:, k])
-      new_abundances[:, k]          = _safe_interp(elevation, np.flip(elevation_afterdeposit - Tprimary), np.flip(abundances_afterdeposit[:, k])) #[area fraction]
+  # Interpolate onto the original grid
+  deposit_top   = surface_elevation + Tprimary
+  above_deposit = elevation > deposit_top
+  for k in range(n_component):
+    new_abundances[:, k] = _safe_interp(elevation, np.flip(elevation_mixinggrid), np.flip(abundances_mixinggrid[:, k])) #[area fraction]
+    # Zero above the deposit top (where no material has been placed yet)
+    new_abundances[above_deposit, k] = 0.0
+    # Below the mixing zone, restore original abundances for preexisting components
+    if k < idx_newcomponent:
+      new_abundances[:, k] = np.where(deep_mask, abundances_2d[:, k], new_abundances[:, k])
   return new_abundances
 
 
