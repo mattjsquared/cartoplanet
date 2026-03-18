@@ -46,7 +46,7 @@ def great_circle_distance(lat1, lon1, lat2, lon2, R=config.getfloat(body, "R0")/
   return 2 * R * np.arcsin(np.sqrt(a))
 
 
-def Xie_figure5() -> tuple:
+def Xie_figure5(grid=False) -> tuple:
   """
   Code to reproduce Figure 5 of Xie et al. (2020):
   Xie, M., T. Liu, and A. Xu (2020), Ballistic sedimentation of impact crater ejecta: Implications for resurfacing and the provenance of lunar samples. Journal of Geophysical Research: Planets, 125, e2019JE006113. https://doi.org/10.1029/2019JE006113.
@@ -59,27 +59,37 @@ def Xie_figure5() -> tuple:
   basin_lon = -94.58
   basin_Dat = 418
   basin_Rat = basin_Dat / 2
-  ds = xr.Dataset({
-    'R':   basin_Rat * 1.3,
-    'Rat': basin_Rat,
-  })
+  ds = xr.Dataset(
+    {
+      'R':   (('basin',), [basin_Rat * 1.3]),
+      'Rat': (('basin',), [basin_Rat]),
+      'clat': (('basin',), [basin_lat]),
+      'clon': (('basin',), [basin_lon]),
+      'order': (('basin',), [0])
+    },
+    coords = {
+      'basin': [basin_name],
+    }
+  )
   coord_A16 = (-8.973, 15.5)
   ### //Initialize for ejecta emplacement//
+  # Ejecta model
+  ejecta_model   = EjectaModel()
+  ejecta_model.Y = 10e6
   # Elevation grid
   dz        = 0.05
   max_depth = 1e4
   nz        = int(max_depth / dz) + 1
-  elevation = np.linspace(dz/2, -max_depth + (dz/2), nz)
-  # Ejecta model
-  ejecta_model   = EjectaModel()
-  ejecta_model.Y = 10e6
+  elevation = None
   # Prep SOI conditions
   rSOI     = great_circle_distance(basin_lat, basin_lon, coord_A16[0], coord_A16[1])
   cache    = precompute_SOI(ds, rSOI=[rSOI], ejecta_model=ejecta_model)
   Tprimary = cache['thickness_primary'][0]
   ### //Compute vertical mixing//
   kernel              = compute_mixing_kernel(cache, 0)
-  abundances          = compute_ejecta_mixing(kernel, elevation, None)
+  ds_profile = compute_ejecta_mixing_multi_basin(ds, coord_A16[0], coord_A16[1], elevation, ejecta_model)
+  elevation = ds_profile['elevation'].values
+  abundances = ds_profile['abundance'].values
   ## TODO: Find a way to make this loop run faster
   frac_excavatedlocal_mixinggrid = np.asarray([
     compute_coverage_fraction(
@@ -118,15 +128,15 @@ def Xie_figure5() -> tuple:
     ax[0].set_ylim((0, 100))
     # Orientale vs. local abundance vs depth
     ax[1].semilogx(
-      -(elevation + Tprimary), 
-      abundances[:, 0] * 100, 
+      -elevation + Tprimary, 
+      ds_profile.sel(basin='Orientale')['abundance'].values * 100, 
       color = [1, 0, 0],
       linewidth = 2,
       label = "Orientale ejecta"
     )
     ax[1].semilogx(
-      -(elevation + Tprimary), 
-      (1 - abundances[:, 0]) * 100, 
+      -elevation + Tprimary, 
+      ds_profile.sel(basin='preimpact')['abundance'].values * 100, 
       color = [0, 0, 0], 
       linewidth = 2, 
       label = "Pre-Orientale materials"
@@ -142,11 +152,13 @@ def Xie_figure5() -> tuple:
       a.set_yticks(np.linspace(0, 100, 11))
       a.minorticks_on()
       a.tick_params(which='both', direction='in', right=True, top=True)
+      if grid:
+        a.grid()
     plt.show()
   return Tprimary, frac_excavatedlocal, abundances, elevation
 
 
-def Xie_figure10c() -> tuple:
+def Xie_figure10c(grid=False) -> tuple:
   """
   Code to reproduce Figure 10c of Xie et al. (2020):
   Xie, M., T. Liu, and A. Xu (2020), Ballistic sedimentation of impact crater ejecta: Implications for resurfacing and the provenance of lunar samples. Journal of Geophysical Research: Planets, 125, e2019JE006113. https://doi.org/10.1029/2019JE006113.
@@ -180,17 +192,20 @@ def Xie_figure10c() -> tuple:
   dz        = 0.05
   max_depth = 1e4
   nz        = int(max_depth / dz) + 1
-  elevation = np.linspace(dz/2, -max_depth + (dz/2), nz)
+  if TEST:
+    elevation = None
+  else:
+    elevation = np.linspace(dz/2, -max_depth + (dz/2), nz)
   # Ejecta model
   ejecta_model   = EjectaModel(material="sand")
   ejecta_model.Y = 10e6
-  n_basins       = len(basin_names)
-  Tprimary       = np.zeros(n_basins)
-  abundances               = None
-  abundances_without_later = np.zeros((len(elevation), n_basins))
   ### //Emplace basins chronologically//
   ds_profile = compute_ejecta_mixing_multi_basin(ds_basin, coord_A16[0], coord_A16[1], elevation, ejecta_model, preimpact_label="Pre-Nectarian")
+  elevation = ds_profile['elevation'].values
   ### //Plot//
+  depth = -elevation
+  if TEST:
+    depth += ds_profile.attrs['Tprimary_total'].item()
   with plt.rc_context({
       'font.family': 'Myriad Pro',
       'figure.dpi': 300,
@@ -201,14 +216,22 @@ def Xie_figure10c() -> tuple:
     # Plot basins
     for i, b in enumerate(ds_profile['basin'].values):
       basin = ds_profile.sel(basin=b)
+      if i == 0:
+        ax.loglog(
+          depth,
+          (1 - ds_profile.sel(basin='Nectaris')['abundance_iflast'].values) * 100,
+          color = C1[i],
+          linestyle = '--'
+        )
+      else:
+        ax.loglog(
+          depth,
+          basin['abundance_iflast'].values * 100,
+          color = C1[i],
+          linestyle = '--'
+        )
       ax.loglog(
-        -elevation + sum(ds_profile['primary_thickness'].values[i+1:]),
-        basin['abundance_iflast'].values * 100,
-        color = C1[i],
-        linestyle = '--'
-      )
-      ax.loglog(
-        -elevation,
+        depth,
         basin['abundance'].values * 100,
         color = C1[i]
       )
@@ -221,6 +244,8 @@ def Xie_figure10c() -> tuple:
     ax.set_ylabel("Abundance of basin ejecta in deposits (%)")
     ax.minorticks_on()
     ax.tick_params(axis='both', which='both', direction='in', top=True, right=True)
+    if grid:
+      ax.grid()
     plt.show()
   return ds_profile
 
@@ -440,7 +465,7 @@ def precompute_SOI(
       warnings.warn("`rSOI` is set, so `nSOI` will be ignored.")
     dist_km = np.asarray(rSOI) #[km]
     if any(dist_km < min_dist) or any(dist_km > max_dist):
-      raise ValueError(f"All values in `rSOI` must be between {min_dist:.2f} km and {max_dist:.2f} km.")
+      raise ValueError(f"{ds_basin.basin.item()} (R={R_km:.2f}km, Rat={Rat_km:.2f}km): All values in `rSOI` must be between {min_dist:.2f} km and {max_dist:.2f} km. Invalid values are {dist_km[(dist_km < min_dist) | (dist_km > max_dist)]}.")
     dist_m  = dist_km * 1e3 #[m]
   
   ### //Define size of each SOI -- Section 2.1.1 of Xie et al. (2020)// ###
@@ -878,14 +903,14 @@ def compute_mixing_kernel(
   deff_max = _deff(mh) #[m]
   deff_min = _deff(ml) #[m]
   ### //Calculate primary ejecta deposit layer parameters//
-  Tprimary_perlayer = max(deff_max / 5000, pthick / 100)           #[m]
-  N_layers = int(np.ceil(pthick / Tprimary_perlayer))
-  Tprimary_perlayer = pthick / N_layers                            #[m]
-  elevation_layerbottoms = np.arange(N_layers) * Tprimary_perlayer #[m]
+  Tprimary_onelayer = max(deff_max / 5000, pthick / 100)           #[m]
+  N_layers = int(np.ceil(pthick / Tprimary_onelayer))
+  Tprimary_onelayer = pthick / N_layers                            #[m]
+  elevation_layerbottoms = np.arange(N_layers) * Tprimary_onelayer #[m]
   ### // Define depth grid//
   zmax        = deff_max                                                     #[m]
-  mixing_grid = np.arange(-Tprimary_perlayer / 2, -zmax, -Tprimary_perlayer) #[m]
-  dz          = Tprimary_perlayer                                            #[m]
+  mixing_grid = np.arange(-Tprimary_onelayer / 2, -zmax, -Tprimary_onelayer) #[m]
+  dz          = Tprimary_onelayer                                            #[m]
   ### //Compute mixing kernel//
   T_LM_values  = -mixing_grid               #[m] -- make values positive
   Wmz_onelayer = np.zeros_like(T_LM_values) #[area fraction]
@@ -919,14 +944,14 @@ def compute_mixing_kernel(
   if np.any(Wmz_onelayer < 0) or np.any(Wmz_onelayer > 1):
     raise ValueError("Computed coverage fractions are out of bounds [0, 1]. Check the integration and input parameters.")
   ### //Return the kernel//
-  Texcavated_alllayers = np.sum(dz * Wmz_onelayer) #[m]
+  Texcavated_onelayer = np.sum(dz * Wmz_onelayer) #[m]
   return {
     'primary_thickness':      pthick,
     'Wmz_onelayer':           Wmz_onelayer,
     'mixing_grid':            mixing_grid,
     'dz':                     dz,
-    'Texcavated_alllayers':   Texcavated_alllayers,
-    'Tprimary_perlayer':      Tprimary_perlayer,
+    'Texcavated_onelayer':    Texcavated_onelayer,
+    'Tprimary_onelayer':      Tprimary_onelayer,
     'N_layers':               N_layers,
     'elevation_layerbottoms': elevation_layerbottoms,
     'zmax':                   zmax,
@@ -937,6 +962,7 @@ def compute_ejecta_mixing(
     kernel: dict,
     elevation: np.ndarray,
     abundances: np.ndarray = None,
+    surface_elevation: float = 0.0,
 ) -> np.ndarray:
   """
   Compute vertical mixing of primary ejecta with local material for a single SOI using a pre-built 
@@ -953,6 +979,9 @@ def compute_ejecta_mixing(
   abundances : ndarray, shape (m_elev, n_existing) or None
     Abundance of each pre-existing ejecta component versus `elevation`.
     Passing `None` (or an empty array) computes only this basin's mixing profile.
+  surface_elevation : float
+    Elevation of the surface before deposition of this basin's ejecta. Used to adjust for a non-zero
+    elevation of the pre-impact surface. Default is 0 m. 
 
   Returns
   -------
@@ -969,16 +998,17 @@ def compute_ejecta_mixing(
   ### //Fetch parameters from kernel//
   Tprimary               = kernel['primary_thickness']      #[m]
   Wmz_onelayer           = kernel['Wmz_onelayer']           #[area fraction]
+  mixing_grid            = kernel['mixing_grid']            #[m] -- w.r.t. pre-impact surface
   dz                     = kernel['dz']                     #[m]
-  Texcavated_alllayers   = kernel['Texcavated_alllayers']   #[m]
-  Tprimary_perlayer      = kernel['Tprimary_perlayer']      #[m]
+  Texcavated_onelayer    = kernel['Texcavated_onelayer']    #[m]
+  Tprimary_onelayer      = kernel['Tprimary_onelayer']      #[m]
   N_layers               = kernel['N_layers']
   elevation_layerbottoms = kernel['elevation_layerbottoms'] #[m]
   zmax                   = kernel['zmax']                   #[m]
   ### //Define interpolation helper function to prevent invalid values//
-  def _safe_interp(x, xp, fp):
-    result = np.interp(x, xp, fp)
-    if any(x > 1 for x in result) or any(x < 0 for x in result):
+  def _safe_interp(x, xp, fp, left=None, right=None):
+    result = np.interp(x, xp, fp, left=left, right=right)
+    if np.any(result > 1) or np.any(result < 0):
       raise ValueError("Interpolation error: Unexpected extrapolation, or data values are not between 0 and 1.")
     return result
   ### //Initialize mixing components//
@@ -994,35 +1024,67 @@ def compute_ejecta_mixing(
   elevation_toplayer    = Tprimary - (dz / 2)                                                #[m]
   n_depth_fill          = int(abs(elevation_toplayer / dz))
   elevation_deposit     = np.flip(np.linspace(dz / 2, elevation_toplayer, n_depth_fill + 1)) #[m]
-  elevation_mixinggrid  = np.concatenate((elevation_deposit, kernel['mixing_grid']))         #[m]
+  elevation_mixinggrid  = np.concatenate((elevation_deposit, mixing_grid))                   #[m]
+  if TEST:
+    # Correct grid for surface elevation
+    elevation_mixinggrid    += surface_elevation                                                        #[m]
+    elevation_initialsurface = surface_elevation                                                        #[m] -- elevation of the surface before any of this basin's ejecta is deposited
+  else:
+    elevation_initialsurface                 = elevation_layerbottoms[0]                          #[m] -- elevation of the surface before any of this basin's ejecta is deposited
   ### //Initialize preexisting abundances on the mixing grid//
-  elevation_initialsurface                   = elevation_layerbottoms[0]                          #[m] -- elevation of the surface before any of this basin's ejecta is deposited
   idx_mixingzone                             = np.where((elevation_mixinggrid > (elevation_initialsurface - zmax)) & (elevation_mixinggrid < elevation_initialsurface))[0] #starting indices of the moving mixing-zone window for `elevation_mixinggrid`
   abundances_mixinggrid                      = np.zeros((len(elevation_mixinggrid), n_component)) #[area fraction]
   for k in range(idx_newcomponent): #initialize the first layer's mixing zone with preexisting abundances
-    abundances_mixinggrid[idx_mixingzone, k] = _safe_interp(elevation_mixinggrid[idx_mixingzone], np.flip(elevation), np.flip(abundances_2d[:, k])) #[area fraction] -- abundances of preexisting components within mixing zone for the first layer
+    if True:
+      abundances_mixinggrid[idx_mixingzone, k] = _safe_interp(elevation_mixinggrid[idx_mixingzone], np.flip(elevation), np.flip(abundances_2d[:, k]), right=0) #[area fraction] -- abundances of preexisting components within mixing zone for the first layer
+    else:
+      abundances_mixinggrid[idx_mixingzone, k] = _safe_interp(elevation_mixinggrid[idx_mixingzone], np.flip(elevation), np.flip(abundances_2d[:, k])) #[area fraction] -- abundances of preexisting components within mixing zone for the first layer
   ### //Compute vertical mixing//
+  Wmz_col = Wmz_onelayer[:, None]                                                    #(n_mix, 1) for broadcasting
   for i in range(N_layers): #emplace primary ejecta layer-by-layer
-    ### First handle just primary ejecta for this layer...
-    Texcavated = np.sum(dz * abundances_mixinggrid[idx_mixingzone, idx_newcomponent] * Wmz_onelayer) #[m] -- thickness of preexisting material excavated by deposition of this layer
-    frac_new   = (Tprimary_perlayer + Texcavated) / (Tprimary_perlayer + Texcavated_alllayers)       #[volume fraction] -- fraction of this layer's mixed material that is new primary ejecta
-    abundances_mixinggrid[idx_mixingzone,        idx_newcomponent] = abundances_mixinggrid[idx_mixingzone, idx_newcomponent]*(1 - Wmz_onelayer) + frac_new*Wmz_onelayer
-    abundances_mixinggrid[idx_mixingzone[0]-1, idx_newcomponent] = frac_new
-    ### ...then loop to redistribute preexisting components
-    for k in range(idx_newcomponent):
-      Tk_excavated = np.sum(dz * abundances_mixinggrid[idx_mixingzone, k] * Wmz_onelayer)
-      frac_k       = Tk_excavated / (Texcavated_alllayers + Tprimary_perlayer)
-      abundances_mixinggrid[idx_mixingzone,      k]  = abundances_mixinggrid[idx_mixingzone, k]*(1 - Wmz_onelayer) + frac_k*Wmz_onelayer
-      abundances_mixinggrid[idx_mixingzone[0]-1, k] += frac_k
-    ### Shift the mixing zone up for the next layer
+    # Compute excavated thicknesses for ALL components at once
+    abundances_mixingwindow = abundances_mixinggrid[idx_mixingzone]                  #(n_mix, n_component) view
+    Texcavated_k = (dz * abundances_mixingwindow * Wmz_col).sum(axis=0)              #(n_component,) -- excavated thickness of each component during deposition of this layer
+    # Primary ejecta for this layer
+    Texcavated_primary = Texcavated_k[idx_newcomponent]                              #[m]
+    Ttotal_onelayer    = Tprimary_onelayer + Texcavated_onelayer                     #[m]
+    newfrac_primary    = (Tprimary_onelayer + Texcavated_primary) / Ttotal_onelayer  #[volume fraction]
+    # Preexisting component fractions
+    newfrac_k          = np.append(Texcavated_k[:idx_newcomponent] / Ttotal_onelayer, newfrac_primary) #(n_component,)
+    # Update mixing zone — all components at once
+    abundances_mixinggrid[idx_mixingzone, :] = abundances_mixingwindow[:, :]*(1 - Wmz_col) + newfrac_k*Wmz_col
+    # Deposit layer
+    abundances_mixinggrid[idx_mixingzone[0]-1, :] = newfrac_k
+    # Shift the mixing zone up for the next layer
     idx_mixingzone -= 1
   ### //Stack the new/mixed deposit on top of the original elevation grid and interpolate results onto that grid//
-  elevation_afterdeposit  = np.concatenate((np.flip(elevation_layerbottoms) + Tprimary_perlayer / 2, elevation)) #[m]
-  abundances_afterdeposit = np.zeros((len(elevation_afterdeposit), n_component))                                 #[area fraction]
-  new_abundances          = np.zeros((len(elevation), n_component))                                              #[area fraction]
-  for k in range(n_component):
-    abundances_afterdeposit[:, k] = _safe_interp(elevation_afterdeposit, np.flip(elevation_mixinggrid), np.flip(abundances_mixinggrid[:, k]))   #[area fraction]
-    new_abundances[:, k]          = _safe_interp(elevation, np.flip(elevation_afterdeposit - Tprimary), np.flip(abundances_afterdeposit[:, k])) #[area fraction]
+  # Identify elevations outside the mixing zone where extrapolation would be invalid
+  deep_mask      = elevation < np.min(elevation_mixinggrid) # below mixing zone on the original elevation grid
+  new_abundances = np.zeros((len(elevation), n_component))  #[area fraction]
+  if TEST:
+    # Interpolate onto the original grid
+    deposit_top   = surface_elevation + Tprimary
+    above_deposit = elevation > deposit_top
+    for k in range(n_component):
+      new_abundances[:, k] = _safe_interp(elevation, np.flip(elevation_mixinggrid), np.flip(abundances_mixinggrid[:, k])) #[area fraction]
+      # Zero above the deposit top (where no material has been placed yet)
+      new_abundances[above_deposit, k] = 0.0
+      # Below the mixing zone, restore original abundances for preexisting components
+      if k < idx_newcomponent:
+        new_abundances[:, k] = np.where(deep_mask, abundances_2d[:, k], new_abundances[:, k])
+  else:
+    ## TODO: `elevation_afterdeposit` is currently susceptible to duplication/non-monotonicity
+    n_deposit               = len(elevation_layerbottoms)
+    elevation_afterdeposit  = np.concatenate((np.flip(elevation_layerbottoms) + Tprimary_onelayer/2, elevation)) #[m]
+    abundances_afterdeposit = np.zeros((len(elevation_afterdeposit), n_component))                               #[area fraction]
+    for k in range(n_component):
+      abundances_afterdeposit[:, k] = _safe_interp(elevation_afterdeposit, np.flip(elevation_mixinggrid), np.flip(abundances_mixinggrid[:, k]))   #[area fraction]
+      # Below the mixing zone, restore original abundances instead of extrapolating
+      if k < idx_newcomponent:
+        abundances_afterdeposit[n_deposit:, k] = np.where(deep_mask, abundances_2d[:, k], abundances_afterdeposit[n_deposit:, k])
+      else:
+        abundances_afterdeposit[n_deposit:, k] = np.where(deep_mask, 0.0, abundances_afterdeposit[n_deposit:, k])
+      new_abundances[:, k]          = _safe_interp(elevation, np.flip(elevation_afterdeposit - Tprimary), np.flip(abundances_afterdeposit[:, k])) #[area fraction]
   return new_abundances
 
 
@@ -1035,7 +1097,7 @@ def compute_ejecta_mixing_multi_basin(
     preimpact_label: str = None
 ) -> xr.Dataset:
   """
-  
+  Run a vertical mixing simulation at a coordinate given a chronological sequence of basin-forming impacts.
 
   Parameters
   ----------
@@ -1068,38 +1130,70 @@ def compute_ejecta_mixing_multi_basin(
     - abundance : area or volume fraction of each basin's primary ejecta at each elevation
     - abundance_iflast : area or volume fraction of each basin's primary ejecta at each elevation if there were no subsequent impacts
   """
+  ## TODO: Add multi-SOI capability a la:
+  ## ds_basin = ds_basin.assign_coords(
+  ##   soi_lat=('soi', [lat1, lat2, ...]),
+  ##   soi_lon=('soi', [lon1, lon2, ...]),
+  ## )
+  ## ds_basin['dist_to_soi'] = (('basin', 'soi'), dist_array)
+  ## ds_basin['soi_cache'] = (('basin', 'soi'), cache_array)
+
   ### //Initialize the computation//
+  # Initialize the SOI caches
+  if 'soi_cache' not in ds_basin:
+    caches = []
+    for b in tqdm(ds_basin['basin'].values, desc="Pre-computing basin SOI caches"):
+      basin = ds_basin.sel(basin=b)
+      rSOI = great_circle_distance(profile_lat, profile_lon, basin.clat, basin.clon) #[km]
+      cache = precompute_SOI(ds_basin=basin, rSOI=[rSOI], ejecta_model=ejecta_model)
+      caches.append(cache)
+    ds_basin['soi_cache'] = (('basin',), np.array(caches, dtype=object))
+  # Initialize the primary ejecta thicknesses
+  if 'primary_thickness' not in ds_basin:
+    primary_thicknesses = []
+    for b in ds_basin['basin'].values:
+      cache = ds_basin.sel(basin=b)['soi_cache'].item()
+      primary_thicknesses.append(cache['thickness_primary'][0])                    #[m]
+    ds_basin['primary_thickness'] = (('basin',), np.array(primary_thicknesses)) #[m]
+  Tprimary_total = ds_basin['primary_thickness'].sum()
   # Set up the elevation grid
   if elevation is None:
-    dz        = 10                                            #[m]
-    max_elev  = 1e4                                           #[m]
-    max_depth = 1e4                                           #[m]
-    elevation = np.arange((max_elev - dz/2), -max_depth, -dz) #[m]
+    dz              = 0.05                                                        #[m]
+    max_depth       = 1e4                                                         #[m]
+    elevation_below = np.arange(-dz/2, -max_depth, -dz)                           #[m]
+    elevation_above = np.arange(dz/2, Tprimary_total, dz)                         #[m]
+    elevation       = np.concatenate((np.flip(elevation_above), elevation_below)) #[m]
   else:
-    elevation = np.asarray(elevation)                         #[m]
+    elevation = np.asarray(elevation)                                             #[m]
   # Fetch the ordered list of basins
-  basins_ordered = ds_basin.sortby('order')['basin'].values
+  basins_ordered = ds_basin.sortby('order')
   # Define the output dataset
   pre_lbl = preimpact_label or 'preimpact'
   ds_profile = xr.Dataset(
+    {
+      'primary_thickness': (('basin',), np.concatenate(([0], basins_ordered['primary_thickness'].values))), #[m]
+    },
     coords = {
       'elevation': elevation,
-      'basin': np.concatenate(([pre_lbl], basins_ordered))
+      'basin': np.concatenate(([pre_lbl], basins_ordered['basin'].values)),
+    },
+    attrs = {
+      'Tprimary_total': Tprimary_total,
     }
   )
+  ds_profile = ds_profile.assign(primary_thickness_cumulative = lambda ds: ds['primary_thickness'].cumsum())
   ### //Run the chronological vertical mixing//
-  Tprimary = [np.nan]
-  abundances = np.ones((len(elevation), 1))
-  abundances_iflast = np.ones_like(abundances)
-  for b in basins_ordered:
-    basin  = ds_basin.sel(basin=b)
-    rSOI   = great_circle_distance(profile_lat, profile_lon, basin.clat, basin.clon) #[km]
-    cache  = precompute_SOI(ds_basin=basin, rSOI=[rSOI], ejecta_model=ejecta_model)
-    kernel = compute_mixing_kernel(cache, 0)
-    Tprimary.append(kernel['primary_thickness'])
-    abundances = compute_ejecta_mixing(kernel, elevation, abundances)
-    abundances_iflast = np.concatenate((abundances_iflast, abundances[:, -1][:, None]), axis=1)
-  ds_profile['primary_thickness'] = (('basin',), Tprimary)
+  abundances          = np.where(elevation[:, None] < 0, 1.0, 0.0)
+  abundances_iflast   = abundances.copy()
+  for b in tqdm(basins_ordered['basin'].values, desc="Computing each basin's vertical mixing"):
+    cache             = ds_basin.sel(basin=b)['soi_cache'].item() #fetch the pre-computed SOI cache for this basin
+    kernel            = compute_mixing_kernel(cache, 0)
+    basin             = ds_profile.sel(basin=b)
+    abundances        = compute_ejecta_mixing(kernel, elevation, abundances, surface_elevation=basin['primary_thickness_cumulative'].item()-basin['primary_thickness'].item())
+    abundances_iflast_thisbasin = abundances[:, -1].copy()[:, None]
+    abundances_iflast_thisbasin[abundances_iflast_thisbasin == 0] = np.nan
+    abundances_iflast = np.concatenate((abundances_iflast, abundances_iflast_thisbasin), axis=1)
+
   for var_name, var in zip(['abundance', 'abundance_iflast'], [abundances, abundances_iflast]):
     ds_profile[var_name] = (('elevation', 'basin'), var)
   return ds_profile
@@ -1192,7 +1286,7 @@ def compute_thickness_1D(
       pre_deff = cache['pre_central_effective_depth'][i],
     )
     # Check for valid solution
-    if (_coverage_frac_i(0) <= ejecta_model.cov):
+    if (_coverage_frac_i(0) <= ejecta_model.cov) and (ejecta_model.cov != 1.0):
       raise ValueError(f"Maximum coverage {_coverage_frac_i(0)} is not greater than `cov` ({ejecta_model.cov}) at distance {dist_km[i]:.2f} km; cannot compute local excavation thickness.")
     # Solve for local excavation thickness that yields desired coverage fraction
     Tmax = _central_effective_depth_i(cache['mass_upper'][i])
@@ -1223,6 +1317,7 @@ def build_global_ejecta_dataset(
   ds_in: xr.Dataset,
   nSOI: int = 20,
   nlat: int = 200,
+  ejecta_model: EjectaModel = None,
   radius_cutoff: float = None,
   R0: float = config.getfloat(body, 'R0'),
   verbose: int = 0
@@ -1240,6 +1335,8 @@ def build_global_ejecta_dataset(
     Number of SOI points for the 1D profile.
   nlat : int
     Number of latitude points for the 2D profile (number of longitude points is 2*nlat).
+  ejecta_model : optional, EjectaModel
+    EjectaModel object that specifies base parameters for ballistic sedimentation model. If `None`, defaults will be used.
   radius_cutoff : float or None
     If provided, passed to compute_thickness_1D for outer cutoff.
   R0 : float
@@ -1267,7 +1364,7 @@ def build_global_ejecta_dataset(
 
   # Sample first basin for ND
   example = ds.isel(basin=0)
-  d0, p0, l0, t0 = compute_thickness_1D(example, nSOI=nSOI, radius_cutoff=radius_cutoff)
+  d0, p0, l0, t0 = compute_thickness_1D(example, nSOI=nSOI, radius_cutoff=radius_cutoff, ejecta_model=ejecta_model)
   ND = d0.size
 
   # Pre-allocate
@@ -1284,7 +1381,7 @@ def build_global_ejecta_dataset(
   for i, basin_name in enumerate(tqdm(ds.basin.values, desc="Basins")):
     b = ds.sel(basin=basin_name)
     # 1D
-    d1, p1, l1, t1 = compute_thickness_1D(b, nSOI=nSOI, radius_cutoff=radius_cutoff)
+    d1, p1, l1, t1 = compute_thickness_1D(b, nSOI=nSOI, radius_cutoff=radius_cutoff, ejecta_model=ejecta_model)
     dist1d[i]    = d1
     primary1d[i] = p1
     local1d[i]   = l1
@@ -1311,10 +1408,10 @@ def build_global_ejecta_dataset(
     primary1d  = (("basin","profile_pt"), primary1d),
     local1d    = (("basin","profile_pt"), local1d),
     total1d    = (("basin","profile_pt"), total1d),
-    dists2d    = (("basin","lat","lon"),    dist2d),
-    primary2d  = (("basin","lat","lon"),    primary2d),
-    local2d    = (("basin","lat","lon"),    local2d),
-    total2d    = (("basin","lat","lon"),    total2d),
+    dists2d    = (("basin","lat","lon"),  dist2d),
+    primary2d  = (("basin","lat","lon"),  primary2d),
+    local2d    = (("basin","lat","lon"),  local2d),
+    total2d    = (("basin","lat","lon"),  total2d),
   )
 
   # Global sum
@@ -1332,6 +1429,7 @@ def build_global_ejecta_dataset(
 def global_ejecta_compacted_ordered(
     ds: xr.Dataset,
     ordered_basins: list[str],
+    zero_basins: bool = False,
     verbose: bool = False
 ) -> xr.Dataset:
   """
@@ -1393,6 +1491,13 @@ def global_ejecta_compacted_ordered(
     # 5) zero out points whose distance ≤ basin_radius
     mask = (basin_dists <= basin_radius)
     total_compacted[mask] = 0.0
+  
+  if zero_basins:
+    for b in ordered_basins:
+      basin_dists  = ds.dists2d.sel(basin=b).values #km (lat, lon) -- distance of each grid point from basin center
+      basin_radius = ds.R.sel(basin=b).item()       #km -- final basin rim radius
+      mask = (basin_dists <= basin_radius)
+      total_compacted[mask] = 0.0
 
   # write the new global_total back into a copy of ds
   return ds.assign(global_total=(('lat', 'lon'), total_compacted))
