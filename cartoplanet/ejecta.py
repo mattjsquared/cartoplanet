@@ -74,39 +74,20 @@ def Xie_figure5(grid=False) -> tuple:
   # Ejecta model
   ejecta_model   = EjectaModel()
   ejecta_model.Y = 10e6
-  # Elevation grid
-  dz        = 0.05
-  max_depth = 1e4
-  nz        = int(max_depth / dz) + 1
-  elevation = None
   # Prep SOI conditions
   rSOI     = great_circle_distance(basin_lat, basin_lon, coord_A16[0], coord_A16[1])
   cache    = precompute_SOI(ds, rSOI=[rSOI], ejecta_model=ejecta_model)
   Tprimary = cache['thickness_primary'][0]
   ### //Compute vertical mixing//
-  kernel              = compute_mixing_kernel(cache, 0)
-  ds_profile = compute_ejecta_mixing_multi_basin(ds, coord_A16[0], coord_A16[1], elevation, ejecta_model)
-  elevation = ds_profile['elevation'].values
+  ds_profile = compute_ejecta_mixing_multi_basin(ds, coord_A16[0], coord_A16[1], ejecta_model=ejecta_model)
+  elevation  = ds_profile['elevation'].values
   abundances = ds_profile['abundance'].values
-  ## TODO: Find a way to make this loop run faster
-  frac_excavatedlocal_mixinggrid = np.asarray([
-    compute_coverage_fraction(
-      d,
-      ejecta_model,
-      cache['pre_frag_radius'],
-      cache['exp_sec_transient_radius'],
-      cache['mass_lower'],
-      cache['mass_upper'],
-      cache['mass_norm_constant'], 
-      cache['soi_area'],
-      Tprimary,
-      cache['pre_sec_transient_radius1'],
-      cache['pre_sec_transient_radius2'],
-      cache['pre_central_effective_depth']
-    )
-    for d in -kernel['mixing_grid']
-  ])
-  frac_excavatedlocal = np.interp(elevation, np.flip(kernel['mixing_grid']), np.flip(frac_excavatedlocal_mixinggrid))
+  frac_excavatedlocal = get_coverage_fraction(
+    depths      = np.maximum(-elevation, 0),
+    layer_mode  = 'all',
+    soi_cache   = cache,
+    i_soi       = 0,
+  )
   ### //Plot//
   with plt.rc_context({
       'font.family': 'Myriad Pro',
@@ -546,15 +527,33 @@ def precompute_SOI(
 
 def compute_central_effective_depth(                                 #d_eff (Eq. 17 of Xie et al. (2020))
     m: float,
-    pre_frag_radius: float,
-    pre_sec1: float,
-    pre_sec2: float,
-    exp_sec_transient_radius: float,
-    pre_deff: float
+    cache: dict,
+    i_soi: int,
 ) -> float:
   """
-  Eq. 17 of Xie et al. (2020)
+  Maximum (i.e., central) excavation depth of the crater formed by a fragment of mass `m`.
+  Eq. 17 of Xie et al. (2020).
+
+  Parameters
+  ----------
+  m : float
+    Mass of the fragment (g).
+  cache : dict
+    Dictionary containing pre-computed per-SOI parameters for ballistic sedimentation calculations, as 
+    returned by `precompute_SOI()`.
+  i_soi : int
+    Index for arrays in `cache` corresponding to the SOI in which to do the calculation.
+  
+  Returns
+  -------
+  deff : float
+    Central effective excavation depth for a fragment of mass `m` in the SOI with index `i_soi`.
   """
+  pre_frag_radius          = cache['pre_frag_radius']
+  exp_sec_transient_radius = cache['exp_sec_transient_radius']
+  pre_sec1                 = cache['pre_sec_transient_radius1'][i_soi]
+  pre_sec2                 = cache['pre_sec_transient_radius2'][i_soi]
+  pre_deff                 = cache['pre_central_effective_depth'][i_soi]
   a = pre_frag_radius * m**(1/3)
   sec_transient_radius = a * (pre_sec1*a + pre_sec2)**(exp_sec_transient_radius)
   return pre_deff * sec_transient_radius
@@ -565,50 +564,65 @@ def compute_coverage_kernel(
     soi_cache: dict,
     i_soi: int,
     nmass: int = 2048,
+    depth_in: np.ndarray = None,
+    coverage_in: np.ndarray = None,
 ) -> tuple[np.ndarray, np.ndarray]:
   """
   Fast vectorized approximation of mass-continuous forms of Eq. 19 or 20 of Xie et al. (2020).
-  Returns mass-space (logarithmic) arrays of effective excavation depths and coverage fractions that can be interpolated to compute the coverage fraction at any depth(s) or to invert for depth corresponding to coverage fraction(s).
+  Can be used to build a mass-space coverage kernel (if `depth_in` and `coverage_in` are both None) 
+  or to compute (1) coverage fraction(s) at `depth_in` or (2) depth(s) at `coverage_in`.
 
   Parameters
   ----------
   layer_mode : {"all", "one"}
-    Whether to compute coverage fraction assuming all layers of primary ejecta are emplaced ("all", corresponding to Eq. 19 of Xie et al. (2020)) or assuming only one layer of primary ejecta is emplaced ("one", corresponding to Eq. 20 of Xie et al. (2020)).
+    Whether to compute coverage fraction assuming all layers of primary ejecta are emplaced 
+    ("all", corresponding to Eq. 19 of Xie et al. (2020)) or assuming only one layer of primary 
+    ejecta is emplaced ("one", corresponding to Eq. 20 of Xie et al. (2020)).
   soi_cache : dict
-    Dictionary containing pre-computed per-SOI parameters for ejecta thickness calculations, as returned by `precompute_SOI()`.
+    Dictionary containing pre-computed per-SOI parameters for ejecta thickness calculations, as 
+    returned by `precompute_SOI()`.
   i_soi : int
     Index of the SOI for which to compute the coverage kernel.
   nmass : int
-    Number of mass bins to use for numerical integration. Higher values yield more accurate results but increase computation time. Default is 2048, which provides a good balance of accuracy and speed for typical use cases.
+    Number of mass bins to use for numerical integration. Higher values yield more accurate results 
+    but increase computation time. Default is 2048, which provides a good balance of accuracy and 
+    speed for typical use cases.
+  depth_in : ndarray, optional
+    If specified, `coverage_in` must be None and `coverage_fraction` will be computed exactly at 
+    the input depths. If None (default), `depth` will be computed as a mass-space grid of effective 
+    excavation depths, and `coverage_fraction` will be computed at those depths.
+  coverage_in : ndarray, optional
+    If specified, `depth_in` must be None and `depths` will be interpolated from a mass-space grid 
+    of effective excavation depths. If None (default), `coverage_fraction` will be computed on `depth`.
   
   Returns
   -------
-  deff : ndarray
-    Array of effective excavation depths (equivalent to a mass-space grid of depths).
-  coverage_fraction : ndarray
-    Array of coverage fractions corresponding to each input `deff`.
+  depth_out : ndarray
+    Array of grid point depths. If `depth_in` is None, this is a mass-space grid of effective 
+    excavation depths. Otherwise, returns `depth_in`.
+  coverage_out : ndarray
+    Array of coverage fractions computed at the points in `depth_out`.
   """
   ### //Process inputs//
   # Normalize parameters
   if layer_mode not in ['all', 'one']:
     raise ValueError("`layer_mode` must be 'all' [for coverage after full primary ejecta deposit is emplaced] or 'one' [for coverage after a single layer is emplaced].")
-  def _as_scalar(x, name):
-    arr = np.asarray(x)
-    if arr.ndim == 0:
-      return float(arr)
-    if arr.size == 1:
-      return float(arr.reshape(-1)[0])
-    raise ValueError(f"`{name}` must be a scalar (or size-1 array), got shape {arr.shape}.")
-  pre_frag_radius = _as_scalar(soi_cache['pre_frag_radius'], 'pre_frag_radius')
-  exp_sec_transient_radius = _as_scalar(soi_cache['exp_sec_transient_radius'], 'exp_sec_transient_radius')
-  ml       = _as_scalar(soi_cache['mass_lower'], 'ml')[i_soi]
-  mh       = _as_scalar(soi_cache['mass_upper'], 'mh')[i_soi]
-  C        = _as_scalar(soi_cache['mass_norm_constant'], 'C')[i_soi]
-  S        = _as_scalar(soi_cache['soi_area'], 'S')[i_soi]
-  pthick   = _as_scalar(soi_cache['thickness_primary'], 'pthick')[i_soi]
-  pre_sec1 = _as_scalar(soi_cache['pre_sec_transient_radius1'], 'pre_sec1')[i_soi]
-  pre_sec2 = _as_scalar(soi_cache['pre_sec_transient_radius2'], 'pre_sec2')[i_soi]
-  pre_deff = _as_scalar(soi_cache['pre_central_effective_depth'], 'pre_deff')[i_soi]
+  if (depth_in is not None) and (coverage_in is not None):
+    raise ValueError("At least one of `depth_in` or `coverage_in` must be None.")
+  if coverage_in:
+    coverage_in = np.asarray(coverage_in)
+    if np.any((coverage_in < 0) | (coverage_in > 1)):
+      raise ValueError("All values in `coverage_in` must be between 0 and 1.")
+  pre_frag_radius = soi_cache['pre_frag_radius']
+  exp_sec_transient_radius = soi_cache['exp_sec_transient_radius']
+  ml       = soi_cache['mass_lower'][i_soi]
+  mh       = soi_cache['mass_upper'][i_soi]
+  C        = soi_cache['mass_norm_constant'][i_soi]
+  S        = soi_cache['soi_area'][i_soi]
+  pthick   = soi_cache['thickness_primary'][i_soi]
+  pre_sec1 = soi_cache['pre_sec_transient_radius1'][i_soi]
+  pre_sec2 = soi_cache['pre_sec_transient_radius2'][i_soi]
+  pre_deff = soi_cache['pre_central_effective_depth'][i_soi]
   if mh <= ml or C <= 0 or S <= 0:
     raise ValueError("Invalid mass bounds, normalization constant, or SOI area in `soi_cache`.")
   ### //Prepare for the vectorized integral//
@@ -618,6 +632,8 @@ def compute_coverage_kernel(
   a      = pre_frag_radius * mspace**(1/3)
   R_at   = a * (pre_sec1*a + pre_sec2)**(exp_sec_transient_radius)
   deff   = pre_deff * R_at
+  # Define depth grid based on input
+  depths = deff if depth_in is None else depth_in
   # Calculate pre-integral mass-discretized exponent of Eq. 19/20 of Xie et al. (2020)
   area = np.pi * R_at**2
   DN   = C * b * mspace**(-b - 1)     #implicitly includes the sum over layers from Eq. 19 of Xie et al. (2020)
@@ -634,33 +650,40 @@ def compute_coverage_kernel(
     N_layers           = int(np.ceil(pthick / Tprimary_perlayer))
     layer_correction   = 1 / N_layers #this cancels the implicit sum over layers in `DN`
   base = area * layer_correction * DN / S
-  ### //Decompose the (1 - T_LM/d_eff) depth correction into two integrals to enable vectorization (designed and implemented by Claude Opus 4.6)//
-  # Compute cumulative integrals from ml to m for O(1) profile queries
-  I0_cum = cumulative_simpson(base, x=mspace, initial=0.0)        #integral of base * 1       (from (1 - T_LM/d_eff) term)
-  I1_cum = cumulative_simpson(base / deff, x=mspace, initial=0.0) #integral of base * 1/d_eff (from (1 - T_LM/d_eff) term)
-  I0_tot = I0_cum[-1]
-  I1_tot = I1_cum[-1]
-  # Interpolate cumulative integrals at m0 corresponding to each depth
+  ### //Decompose the (1 - T_LM/d_eff) depth correction into two integrals to enable vectorization//
+  # Compute reverse cumulative integrals from mh down to each m (avoids "catastrophic cancellation" from forward integral)
+  # `cumulative_simpson` needs monotonically increasing x, so to do the reverse integral we negate and flip
+  neg_mspace = -np.flip(mspace)                                                        #strictly increasing: -mh, ..., -ml
+  base_rev   = np.flip(base)
+  deff_rev   = np.flip(deff)
+  I0_rev = np.flip(cumulative_simpson(base_rev,            x=neg_mspace, initial=0.0)) #(reverse) integral of base       from m to mh
+  I1_rev = np.flip(cumulative_simpson(base_rev / deff_rev, x=neg_mspace, initial=0.0)) #(reverse) integral of base/deff  from m to mh
+  I0_tot = I0_rev[0]
+  I1_tot = I1_rev[0]
+  # Interpolate reverse cumulative integrals at m0 corresponding to each query depth
   deff_min = deff[0]
   deff_max = deff[-1]
-  # m0       = np.interp(depths, deff, mspace, left=ml, right=mh)
-  # I0_lo    = np.interp(m0, mspace, I0_cum)
-  # I1_lo    = np.interp(m0, mspace, I1_cum)
-  # # Calculate the final integral
-  # exponent = (I0_tot - I0_lo) - depths * (I1_tot - I1_lo) #reintroduce T_LM (i.e., depth) from the (1 - T_LM/d_eff) term
-  # exponent = np.where(depths >= deff_max, 0.0, exponent)  #implicitly enforces `max(0, depth_correction)` check before integrating
-  # shallow_exponent = I0_tot - depths * I1_tot
-  # exponent = np.where(depths <= deff_min, shallow_exponent, exponent) #prevent floating-point issues from interpolation at small depths
-  # ### //Return the coverage fraction at each depth//
-  # coverage_fraction = 1 - np.exp(-exponent)
-  # if any(coverage_fraction < 0) or any(coverage_fraction > 1):
-  #   raise ValueError("At least one coverage fraction is out of bounds (should be between 0 and 1).")
-  # return coverage_fraction
-  exponent = (I0_tot - I0_cum) - deff * (I1_tot - I1_cum) #reintroduce T_LM (i.e., depth) from the (1 - T_LM/d_eff) term
+  m0       = np.interp(depths, deff, mspace, left=ml, right=mh)
+  I0_hi    = np.interp(m0, mspace, I0_rev)
+  I1_hi    = np.interp(m0, mspace, I1_rev)
+  # Calculate the exponent: integral from m0 to mh of base*(1 - T_LM/d_eff)
+  exponent = I0_hi - depths * I1_hi
+  exponent = np.where(depths >= deff_max, 0.0, exponent)              #zero coverage beyond deepest excavation
+  shallow_exponent = I0_tot - depths * I1_tot                         #full integral for depths shallower than smallest fragment
+  exponent = np.where(depths <= deff_min, shallow_exponent, exponent)
+  exponent = np.maximum(exponent, 0.0)                                #clamp: exponent is analytically non-negative, but there are sometimes numerical artifacts
+  ### //Return the coverage fraction at each depth//
   coverage_fraction = 1 - np.exp(-exponent)
   if any(coverage_fraction < 0) or any(coverage_fraction > 1):
-    raise ValueError("At least one coverage fraction is out of bounds (should be between 0 and 1).")
-  return deff, coverage_fraction
+    idx_out_of_bounds = (coverage_fraction < 0) | (coverage_fraction > 1)
+    raise ValueError(f"At least one (n={idx_out_of_bounds.sum()}; depths: {depths[idx_out_of_bounds]}) coverage fraction is out of bounds (should be between 0 and 1).")
+  if coverage_in is not None:
+    coverage_out = coverage_in
+    depth_out = np.interp(coverage_out, np.flip(coverage_fraction), np.flip(depths), left=deff_max, right=0.0)
+  else:
+    depth_out = depths
+    coverage_out = coverage_fraction
+  return depth_out, coverage_out
 
 
 def get_coverage_fraction(
@@ -693,8 +716,8 @@ def get_coverage_fraction(
   """
   if any(depths < 0):
     raise ValueError("Depths must be non-negative.")
-  deff, W = compute_coverage_kernel(layer_mode, soi_cache, i_soi, nmass)
-  return np.interp(depths, deff, W, left=1.0, right=0.0)
+  _, W = compute_coverage_kernel(layer_mode, soi_cache, i_soi, nmass, depth_in=depths)
+  return W
 
 
 def get_coverage_depth(
@@ -705,20 +728,26 @@ def get_coverage_depth(
     nmass: int = 2048,
 ) -> np.ndarray:
   """
-  Returns coverage depths corresponding to specified coverage fractions by interpolating the output of `compute_coverage_kernel`.
+  Returns coverage depths corresponding to specified coverage fractions by interpolating the output of 
+  `compute_coverage_kernel`.
 
   Parameters
   ----------
   coverage_fractions : float | np.ndarray
     Coverage fractions at which to compute corresponding depths. Must be between 0 and 1.
   layer_mode : {"all", "one"}
-    Whether to compute coverage fraction assuming all layers of primary ejecta are emplaced ("all", corresponding to Eq. 19 of Xie et al. (2020)) or assuming only one layer of primary ejecta is emplaced ("one", corresponding to Eq. 20 of Xie et al. (2020)).
+    Whether to compute coverage fraction assuming all layers of primary ejecta are emplaced ("all", 
+    corresponding to Eq. 19 of Xie et al. (2020)) or assuming only one layer of primary ejecta is emplaced 
+    ("one", corresponding to Eq. 20 of Xie et al. (2020)).
   soi_cache : dict
-    Dictionary containing pre-computed per-SOI parameters for ejecta thickness calculations, as returned by `precompute_SOI()`.
+    Dictionary containing pre-computed per-SOI parameters for ejecta thickness calculations, as returned 
+    by `precompute_SOI()`.
   i_soi : int
     Index of the SOI for which to compute the coverage depth.
   nmass : int
-    Number of mass bins to use for numerical integration in `compute_coverage_kernel`. Higher values yield more accurate results but increase computation time. Default is 2048, which provides a good balance of accuracy and speed for typical use cases.
+    Number of mass bins to use for numerical integration in `compute_coverage_kernel`. Higher values 
+    yield more accurate results but increase computation time. Default is 2048, which provides a good 
+    balance of accuracy and speed for typical use cases.
 
   Returns
   -------
@@ -727,122 +756,18 @@ def get_coverage_depth(
   """
   if any(coverage_fractions < 0) or any(coverage_fractions > 1):
     raise ValueError("Coverage fractions must be between 0 and 1.")
-  deff, W = compute_coverage_kernel(layer_mode, soi_cache, i_soi, nmass)
-  return np.interp(coverage_fractions, np.flip(W), np.flip(deff), left=deff[-1], right=0.0)
-
-
-def compute_coverage_fraction(
-    T_LM: float,
-    ejecta_model: EjectaModel,
-    pre_frag_radius: float,
-    exp_sec_transient_radius: float,
-    ml: float,
-    mh: float,
-    C: float,
-    S: float,
-    pthick: float,
-    pre_sec1: float,
-    pre_sec2: float,
-    pre_deff: float,
-) -> float:
-  """
-  Eq. 19 of Xie et al. (2020)—computes coverage fraction W(>T_LM).
-
-  Parameters
-  ----------
-  T_LM : float
-    Local excavation thickness [m].
-  ejecta_model : EjectaModel
-    Ejecta model parameters.
-  pre_frag_radius : float
-    Pre-computed factor for fragment radius (see `precompute_SOI`).
-  exp_sec_transient_radius : float
-    Pre-computed exponent for secondary transient crater radius (see `precompute_SOI`).
-  ml : float
-    Minimum fragment mass [kg] (see `precompute_SOI`).
-  mh : float
-    Maximum fragment mass [kg] (see `precompute_SOI`).
-  C : float
-    Normalization constant for fragment mass-frequency distribution (see `precompute_SOI`).
-  S : float
-    SOI surface area [m²] (see `precompute_SOI`).
-  pthick : float
-    Primary ejecta thickness in the SOI area [m] (see `precompute_SOI`).
-  pre_sec1 : float
-    Pre-computed factor for secondary transient crater radius (see `precompute_SOI`).
-  pre_sec2 : float
-    Pre-computed factor for secondary transient crater radius (see `precompute_SOI`).
-  pre_deff : float
-    Pre-computed factor for central effective depth (see `precompute_SOI`).
-  
-  Returns
-  -------
-  W : float
-    Coverage fraction W(>T_LM).
-  """
-  b = ejecta_model.b
-
-  _central_effective_depth = functools.partial(
-    compute_central_effective_depth,
-    pre_frag_radius = pre_frag_radius,
-    pre_sec1 = pre_sec1,
-    pre_sec2 = pre_sec2,
-    exp_sec_transient_radius = exp_sec_transient_radius,
-    pre_deff = pre_deff
-  )
-  
-  deff_min = _central_effective_depth(ml) #d_eff for the smallest fragment mass
-  deff_max = _central_effective_depth(mh) #d_eff for the largest fragment mass
-  if T_LM <= deff_min: #maximum coverage case
-    m0 = ml
-  elif T_LM >= deff_max: #minimum coverage case
-    return 0
-  else:
-    sol = root_scalar(
-      lambda m: _central_effective_depth(m) - T_LM,
-      bracket=[ml, mh],
-      method='bisect'
-    )
-    m0 = sol.root
-  
-  def _f(m):
-    """
-    Analytical equivalent of Riemann sum in Eq. 19 of Xie et al. (2020)
-    """
-    a = pre_frag_radius * m**(1/3) # not using _central_effective_depth because we need R_at for `uncorrected_area`
-    R_at = a * (pre_sec1*a + pre_sec2)**(exp_sec_transient_radius)
-    d_eff = pre_deff * R_at
-    if pthick <= d_eff:                                              #1/N_layers * sum( ( (j-1)*δ_SOI / (N_layers*C_ex*d_ex(R_at(m))) ) ) [analytical replacement]
-      correction2 = 1 - pthick/(2*d_eff)
-    else:
-      correction2 = d_eff/(2*pthick)
-    uncorrected_area = np.pi * R_at**2                               #S_PIS [uncorrected] -- π*R_at(m)^2
-    correction1 = max(0, 1-(T_LM/d_eff))                             #( 1 - T_LM/( C_ex*d_ex(R_at(m)) ) )
-    DN = C * b*m**(-b-1)                                             #ΔN [analytical replacement]
-    return uncorrected_area * correction1 * correction2 * DN / S
-  
-  def _f_log(x):
-    """
-    Convert intermediate solution to logspace for numerical stability in integration
-    """
-    m = np.exp(x)
-    return _f(m) * m
-  
-  integral = quad(_f_log, np.log(m0), np.log(mh), epsabs=0, epsrel=1e-2)[0]
-  W = 1 - np.exp(-integral)
-  return W                                                           #W(>T_LM)
+  depths, _ = compute_coverage_kernel(layer_mode, soi_cache, i_soi, nmass, coverage_in=coverage_fractions)
+  return depths
 
 
 ### Vertical mixing from ballistic sedimentation
-def compute_mixing_kernel(
+def build_mixing_kernel(
     cache: dict,
     i_soi: int,
 ) -> dict | None:
   """
   Build the per-layer depth-excavation coverage kernel for a single SOI and basin.
   The kernel can be referenced when computing layer-by-layer vertical ejecta mixing.
-
-  Analytical equivalent of the Riemann sum in Eq. 20 of Xie et al. (2020), discretized over depth.
 
   Parameters
   ----------
@@ -867,34 +792,18 @@ def compute_mixing_kernel(
     - zmax                   : float   — maximum depth of mixing for one layer
   """
   ### //Fetch parameters from cache for this SOI//
-  ejecta_model    = cache['ejecta_model']
-  b               = ejecta_model.b
-  pre_frag_radius = cache['pre_frag_radius']
-  exp_sec         = cache['exp_sec_transient_radius']
-  ml              = cache['mass_lower'][i_soi]        #[g]
-  mh              = cache['mass_upper'][i_soi]        #[g]
-  C_soi           = cache['mass_norm_constant'][i_soi]
-  S_soi           = cache['soi_area'][i_soi]          #[m^2]
   pthick          = cache['thickness_primary'][i_soi] #[m]
-  pre_sec1        = cache['pre_sec_transient_radius1'][i_soi]
-  pre_sec2        = cache['pre_sec_transient_radius2'][i_soi]
-  pre_deff        = cache['pre_central_effective_depth'][i_soi]
   # No mixing if no primary ejecta is deposited
   if pthick == 0:
     return None
   elif pthick < 0:
     raise ValueError(f"Primary ejecta thickness is <0 ({pthick} m).")
   ### //Predefine d_eff function for this SOI's parameters//
-  _deff = functools.partial(
-    compute_central_effective_depth,
-    pre_frag_radius = pre_frag_radius,
-    pre_sec1 = pre_sec1,
-    pre_sec2 = pre_sec2,
-    exp_sec_transient_radius = exp_sec,
-    pre_deff = pre_deff,
+  deff_max = compute_central_effective_depth(
+    m     = cache['mass_upper'][i_soi], #[g]
+    cache = cache,
+    i_soi = i_soi,
   )
-  deff_max = _deff(mh) #[m]
-  deff_min = _deff(ml) #[m]
   ### //Calculate primary ejecta deposit layer parameters//
   Tprimary_onelayer = max(deff_max / 5000, pthick / 100)           #[m]
   N_layers = int(np.ceil(pthick / Tprimary_onelayer))
@@ -907,32 +816,13 @@ def compute_mixing_kernel(
   ### //Compute mixing kernel//
   T_LM_values  = -mixing_grid               #[m] -- make values positive
   Wmz_onelayer = np.zeros_like(T_LM_values) #[area fraction]
-  ## TODO: Find a way to make this loop run faster
-  for idx, T_LM in enumerate(T_LM_values):
-    if T_LM >= deff_max:
-      continue
-    # Define lower search bound for integral
-    if T_LM <= deff_min:
-      m0 = ml
-    else:
-      m0 = root_scalar(
-        lambda m: _deff(m) - T_LM,
-        bracket=[ml, mh],
-        method='bisect',
-      ).root
-    # Define helper function for integration (Equation 19 of Xie et al. (2020)) (in log space, to improve numerical stability)
-    def _f_log(x, _T=T_LM):
-      m    = np.exp(x)
-      a    = pre_frag_radius * m**(1/3)
-      R_at = a * (pre_sec1 * a + pre_sec2)**exp_sec
-      d_eff_m = pre_deff * R_at
-      area = np.pi * R_at**2
-      corr = max(0.0, 1.0 - _T/d_eff_m)
-      DN   = C_soi * b * m**(-b - 1)
-      return area * corr * DN / (S_soi * N_layers) * m                            # `* m` is from log substitution
-    # Integrate for total coverage fraction at this depth
-    integral_val = quad(_f_log, np.log(m0), np.log(mh), epsabs=0, epsrel=1e-2)[0] #exponent of Eq. 20 of Xie et al. (2020)
-    Wmz_onelayer[idx] = 1 - np.exp(-integral_val)                                 #[area fraction] -- W(>T_LM) for this layer
+  Wmz_onelayer[:] = get_coverage_fraction(
+    depths = T_LM_values,
+    layer_mode = 'one',
+    soi_cache = cache,
+    i_soi = i_soi,
+    nmass = 2048,
+  )
   # Ensure no invalid values
   if np.any(Wmz_onelayer < 0) or np.any(Wmz_onelayer > 1):
     raise ValueError("Computed coverage fractions are out of bounds [0, 1]. Check the integration and input parameters.")
@@ -959,14 +849,14 @@ def compute_ejecta_mixing(
 ) -> np.ndarray:
   """
   Compute vertical mixing of primary ejecta with local material for a single SOI using a pre-built 
-  kernel from `compute_mixing_kernel`. Accounts for multiple components if `abundances` is 2-D.
+  kernel from `build_mixing_kernel`. Accounts for multiple components if `abundances` is 2-D.
 
   This is a semi-analytical pipeline for the layer-by-layer mixing algorithm of Xie et al. (2020).
 
   Parameters
   ----------
   kernel : dict
-    Output of `compute_mixing_kernel`.
+    Output of `build_mixing_kernel`.
   elevation : ndarray, shape (m_elev,)
     Grid of elevation w.r.t. pre-impact surface.
   abundances : ndarray, shape (m_elev, n_existing) or None
@@ -996,7 +886,6 @@ def compute_ejecta_mixing(
   Texcavated_onelayer    = kernel['Texcavated_onelayer']    #[m]
   Tprimary_onelayer      = kernel['Tprimary_onelayer']      #[m]
   N_layers               = kernel['N_layers']
-  elevation_layerbottoms = kernel['elevation_layerbottoms'] #[m]
   zmax                   = kernel['zmax']                   #[m]
   ### //Define interpolation helper function to prevent invalid values//
   def _safe_interp(x, xp, fp, left=None, right=None):
@@ -1160,7 +1049,7 @@ def compute_ejecta_mixing_multi_basin(
   abundances_iflast   = abundances.copy()
   for b in tqdm(basins_ordered['basin'].values, desc="Computing each basin's vertical mixing"):
     cache             = ds_basin.sel(basin=b)['soi_cache'].item() #fetch the pre-computed SOI cache for this basin
-    kernel            = compute_mixing_kernel(cache, 0)
+    kernel            = build_mixing_kernel(cache, 0)
     basin             = ds_profile.sel(basin=b)
     abundances        = compute_ejecta_mixing(kernel, elevation, abundances, surface_elevation=basin['primary_thickness_cumulative'].item()-basin['primary_thickness'].item())
     abundances_iflast_thisbasin = abundances[:, -1].copy()[:, None]
@@ -1235,40 +1124,7 @@ def compute_thickness_1D(
   thickness_primary = cache['thickness_primary']
   thickness_local = np.zeros_like(dist_km)
   for i in range(len(dist_km)):
-    # Cache the d_eff and W routines with per-SOI parameters
-    _central_effective_depth_i = functools.partial(
-      compute_central_effective_depth,
-      pre_frag_radius = cache['pre_frag_radius'],
-      pre_sec1 = cache['pre_sec_transient_radius1'][i],
-      pre_sec2 = cache['pre_sec_transient_radius2'][i],
-      exp_sec_transient_radius = cache['exp_sec_transient_radius'],
-      pre_deff = cache['pre_central_effective_depth'][i],
-    )
-    _coverage_frac_i = functools.partial(
-      compute_coverage_fraction,
-      ejecta_model = ejecta_model,
-      pre_frag_radius = cache['pre_frag_radius'],
-      exp_sec_transient_radius = cache['exp_sec_transient_radius'],
-      ml = cache['mass_lower'][i],
-      mh = cache['mass_upper'][i],
-      C = cache['mass_norm_constant'][i],
-      S = cache['soi_area'][i],
-      pthick = thickness_primary[i],
-      pre_sec1 = cache['pre_sec_transient_radius1'][i],
-      pre_sec2 = cache['pre_sec_transient_radius2'][i],
-      pre_deff = cache['pre_central_effective_depth'][i],
-    )
-    # Check for valid solution
-    if (_coverage_frac_i(0) <= ejecta_model.cov) and (ejecta_model.cov != 1.0):
-      raise ValueError(f"Maximum coverage {_coverage_frac_i(0)} is not greater than `cov` ({ejecta_model.cov}) at distance {dist_km[i]:.2f} km; cannot compute local excavation thickness.")
-    # Solve for local excavation thickness that yields desired coverage fraction
-    Tmax = _central_effective_depth_i(cache['mass_upper'][i])
-    sol = root_scalar(
-      lambda T: _coverage_frac_i(T) - ejecta_model.cov,
-      bracket=[0, Tmax],
-      method='bisect'
-    )
-    thickness_local[i] = sol.root                                    #T_LM_med
+    thickness_local[i] = get_coverage_depth(np.asarray([ejecta_model.cov]), 'all', cache, i)[0]
   thickness_total = thickness_primary + thickness_local #T_ED_med [*median only if `cov=0.5] -- see text below Eq. 19
   return dist_km, thickness_primary, thickness_local, thickness_total
 
