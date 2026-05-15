@@ -1,6 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
+import xarray as xr
 
 from tqdm import tqdm
 from cartoplanet import config
@@ -168,9 +169,10 @@ def compute_ejecta_thickness_and_mixing(
     v_SOI_outer  = rgc2velocity(r_SOI_outer[i_SOI])  #km/s
     v_SOI_center = rgc2velocity(r_SOI_center[i_SOI]) #km/s
 
-    if v_SOI_center >= 2.38:
+    if np.isnan(v_SOI_center) or v_SOI_center >= 2.38:
       T_PE[i_SOI]     = 0
       T_LM_med[i_SOI] = 0
+      abundance_PEinNewED[:, :, i_SOI] = abundance_local_PE[:, :, i_SOI]
       continue
     
     
@@ -201,6 +203,11 @@ def compute_ejecta_thickness_and_mixing(
     b = 0.98 #
 
     ml = mh * 1e-23 #lower limit of ejecta mass
+    if not np.isfinite(mh) or mh <= 0:
+      T_PE[i_SOI]     = 0
+      T_LM_med[i_SOI] = 0
+      abundance_PEinNewED[:, :, i_SOI] = abundance_local_PE[:, :, i_SOI]
+      continue
     C_SOI = M_SOI * (1-b)/b / (mh**(1-b) - ml**(1-b)) # 2
     if C_SOI < 0:
       raise ValueError("C_SOI < 0\n\n")
@@ -232,7 +239,7 @@ def compute_ejecta_thickness_and_mixing(
     
     elevation_bottom_layer = np.linspace(0, T_PE[i_SOI], N_layers+1) #the elevation of the lower boundary of a layer with respect to the surface of local material
     if len(elevation_bottom_layer) <= 2:
-      elevation_bottom_layer = 0
+      elevation_bottom_layer = np.array([0.0])
     else:
       elevation_bottom_layer = elevation_bottom_layer[:-1] #the elevation of the bottom of each layer
     
@@ -320,6 +327,11 @@ def compute_ejecta_thickness_and_mixing(
       abundance_PEinNewED_oneSOI[:, j]                                    = np.interp(Depth_Deposits, np.flip(Depth_Deposits_samebinsize), np.flip(abundance_PEinED_samebinsize[:, j]))
       abundance_PEinNewED_oneSOI[abundance_PEinNewED_oneSOI[:, j]>1, j] = 1 #correct inappropriate values derived from extrapolation if exist
       abundance_PEinNewED_oneSOI[abundance_PEinNewED_oneSOI[:, j]<0, j] = 0 #correct inappropriate values derived from extrapolation if exist
+    # Restore pre-existing composition below the mixing zone to prevent
+    # extrapolation drift that accumulates over many basins
+    n_dep = len(elevation_bottom_layer)
+    deep = Elevation_from_Local_Surface < dmz_max
+    abundance_PEinNewED_oneSOI[n_dep:][deep] = abundance_local_PE[deep, :, i_SOI]
     
     
     #---------------------------------------------------------------------------------------------------
@@ -441,13 +453,86 @@ def Xie_figure10c_benchmark(grid=False):
     ax.set_xlim([0.1, 20000])
     ax.set_yticks([1, 2, 5, 10, 20, 50, 100], labels=['1', '2', '5', '10', '20', '50', '100'])
     ax.set_xlabel("Depth from surface (m)")
-    ax.set_ylabel("Abundance of basin ejecta in deposits (#)")
+    ax.set_ylabel("Abundance of basin ejecta in deposits (%)")
     ax.minorticks_on()
     ax.tick_params(axis='both', which='both', direction='in', top=True, right=True)
     if grid:
       ax.grid()
     plt.show()
   return
+
+
+def Xie_figure10c_benchmark_arbitrary(ds_basin, grid=False):
+  """
+  Code to reproduce Figure 10c of Xie et al. (2020) using the ballistic sedimentation model of Xie et al. (2020):
+  Xie, M., T. Liu, and A. Xu (2020), Ballistic sedimentation of impact crater ejecta: Implications for resurfacing and the provenance of lunar samples. Journal of Geophysical Research: Planets, 125, e2019JE006113. https://doi.org/10.1029/2019JE006113.
+
+  Originally created with MATLAB R2016b:
+  Xie, M. Liu, T. and Xu, A. (2020), Ballistic sedimentaiton model [Code], Zenodo. https://doi.org/10.5281/zenodo.3692887.
+
+  Adapted to Python by Matt Jones 2026.
+  """
+  basins_ordered = ds_basin.sortby('order')
+  df_basin = pd.DataFrame(
+    {
+      'lat': basins_ordered['clat'].values,
+      'lon': basins_ordered['clon'].values,
+      'Dat': basins_ordered['Rat'].values * 2
+    },
+    index = basins_ordered['basin'].values
+  )
+  df_basin['Rat'] = df_basin['Dat'] / 2
+  coord_A16 = [-8.973, 15.5]
+  Tlm, Tpe, abundance_PEinED, secondary_craters, Fraction_ExcavatedLM, elevation, abundance_PEinED_withoutMixingbyLaterEjecta = ballistic_sedimentation_Xie(df_basin, coord_SOI=np.array([coord_A16]))
+  Tlm = Tlm.squeeze()
+  Tpe = Tpe.squeeze()
+  abundance_PEinED = abundance_PEinED.squeeze(axis=2)
+  abundance_PEinED_withoutMixingbyLaterEjecta = abundance_PEinED_withoutMixingbyLaterEjecta.squeeze(axis=2)
+  Rat = df_basin['Rat'].values
+  Name_basin = df_basin.index.values
+  with plt.rc_context({
+      'font.family': 'Myriad Pro',
+      'figure.dpi': 300,
+      'lines.linewidth': 1.5,
+  }):
+    fig, ax = plt.subplots(1, 1, figsize=(6.67, 4))
+    for i in range(len(Rat)+1):
+        clr = np.random.rand(3,)
+        if i < len(Rat):
+            ax.loglog(-elevation+sum(Tpe[i+1:]), abundance_PEinED_withoutMixingbyLaterEjecta[:,i]*100, color=clr, linestyle='--')
+            ax.loglog(-elevation, abundance_PEinED[:, i]*100, color=clr)
+            ax.text(1800, 7*2**(0.5*i), Name_basin[i], color=clr)
+        else:
+            abundance_PreNectarianMaterials = 100 - abundance_PEinED_withoutMixingbyLaterEjecta[:, 0]*100
+            ax.loglog(-elevation+sum(Tpe[1:]), abundance_PreNectarianMaterials, linestyle='--', color=[0.5, 0.5, 0.5])
+            abundance_PreNectarianMaterials = (1 - np.sum(abundance_PEinED, axis=1)) * 100 #abundance_PreNectarianMaterials=(1-sum(abundance_PEinED(:,1:end),2))*100
+            ax.loglog(-elevation, abundance_PreNectarianMaterials, color=[0.5, 0.5, 0.5])
+            ax.text(1800, 4, "Pre-impact\nmaterials", color=[0.5, 0.5, 0.5])
+    ax.set_ylim([0.1, 100])
+    ax.set_xlim([0.1, 20000])
+    ax.set_yticks([1, 2, 5, 10, 20, 50, 100], labels=['1', '2', '5', '10', '20', '50', '100'])
+    ax.set_xlabel("Depth from surface (m)")
+    ax.set_ylabel("Abundance of basin ejecta in deposits (%)")
+    ax.minorticks_on()
+    ax.tick_params(axis='both', which='both', direction='in', top=True, right=True)
+    if grid:
+      ax.grid()
+    plt.show()
+  abundance_preimpact = 1 - np.sum(abundance_PEinED, axis=1)
+  abundance_iflast_preimpact = 1 - abundance_PEinED_withoutMixingbyLaterEjecta[:, 0]
+  ds_profile = xr.Dataset(
+    {
+      'thickness_primary': (('basin',), np.concatenate(([0], Tpe))),
+      'thickness_local': (('basin',), np.concatenate(([0], Tlm))),
+      'abundance': (('elevation', 'basin'), np.concatenate((abundance_preimpact[:, None], abundance_PEinED), axis=1)),
+      'abundance_iflast': (('elevation', 'basin'), np.concatenate((abundance_iflast_preimpact[:, None], abundance_PEinED_withoutMixingbyLaterEjecta), axis=1)),
+    },
+    coords = {
+      'elevation': elevation + np.sum(Tpe),
+      'basin': ['preimpact'] + list(Name_basin)
+    }
+  )
+  return ds_profile
 
 
 def Xie_figure5_benchmark(grid=False):
