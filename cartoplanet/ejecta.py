@@ -6,6 +6,7 @@ import copy, warnings, functools, os
 
 from scipy.integrate import quad, cumulative_simpson
 from scipy.optimize import root_scalar
+from numba import njit
 from tqdm import tqdm
 from cartoplanet import config
 
@@ -844,6 +845,46 @@ def build_mixing_kernel(
   }
 
 
+@njit(cache=True, fastmath=True)
+def _mix_new_component(
+    N_layers: int,
+    abundances_mixinggrid: np.ndarray,
+    mz_start: int,
+    mz_stop: int,
+    dz_Wmz: np.ndarray,
+    newfrac_k: np.ndarray,
+    idx_newcomponent: int,
+    inv_Ttotal: float,
+    Tprimary_onelayer: float,
+    one_m_W: np.ndarray,
+    Wmz_col: np.ndarray,
+):
+  """JIT-optimized sequential vertical mixing loop for adding a new component (i.e., new impact basin)."""
+  n_component = abundances_mixinggrid.shape[1]
+  n_mix = mz_stop - mz_start
+  texcavated_k = np.empty(n_component, dtype=abundances_mixinggrid.dtype)
+  for _ in range(N_layers):
+    for k in range(n_component):
+      s = 0.0
+      for j in range(n_mix):
+        s += dz_Wmz[j, 0] * abundances_mixinggrid[mz_start + j, k]
+      texcavated_k[k] = s
+    for k in range(idx_newcomponent):
+      newfrac_k[k] = texcavated_k[k] * inv_Ttotal
+    newfrac_k[idx_newcomponent] = (Tprimary_onelayer + texcavated_k[idx_newcomponent]) * inv_Ttotal
+    for j in range(n_mix):
+      row = mz_start + j
+      w = Wmz_col[j, 0]
+      omw = one_m_W[j, 0]
+      for k in range(n_component):
+        abundances_mixinggrid[row, k] = abundances_mixinggrid[row, k] * omw + newfrac_k[k] * w
+    dep_row = mz_start - 1
+    for k in range(n_component):
+      abundances_mixinggrid[dep_row, k] = newfrac_k[k]
+    mz_start -= 1
+    mz_stop  -= 1
+
+
 def compute_ejecta_mixing(
     kernel: dict,
     elevation: np.ndarray,
@@ -932,22 +973,20 @@ def compute_ejecta_mixing(
   Ttotal_onelayer = Tprimary_onelayer + Texcavated_onelayer                           #[m] -- constant across layers
   inv_Ttotal      = 1.0 / Ttotal_onelayer                                             #pre-compute reciprocal
   newfrac_k       = np.empty(n_component)                                             #pre-allocate once
-  for i in range(N_layers): #emplace primary ejecta layer-by-layer
-    # Compute excavated thicknesses for ALL components at once (slice = view, no copy)
-    window       = abundances_mixinggrid[mz_start:mz_stop]                           #(n_mix, n_component) view
-    Texcavated_k = (dz_Wmz * window).sum(axis=0)                                     #(n_component,)
-    # Compute deposited fractions
-    newfrac_k[:idx_newcomponent] = Texcavated_k[:idx_newcomponent] * inv_Ttotal
-    newfrac_k[idx_newcomponent]  = (Tprimary_onelayer + Texcavated_k[idx_newcomponent]) * inv_Ttotal
-    # Update mixing zone in-place — all components at once
-    window[:] = window * one_m_W + newfrac_k * Wmz_col
-    # Deposit layer
-    abundances_mixinggrid[mz_start - 1, :] = newfrac_k
-    # Shift the mixing zone up for the next layer
-    mz_start -= 1
-    mz_stop  -= 1
-  ### //Stack the new/mixed deposit on top of the original elevation grid and interpolate results onto that grid//
-  # Interpolate onto the original grid
+  _mix_new_component( #run JIT-optimized vertical mixing loop to populate `abundances_mixinggrid`
+    N_layers,
+    abundances_mixinggrid,
+    mz_start,
+    mz_stop,
+    dz_Wmz,
+    newfrac_k,
+    idx_newcomponent,
+    inv_Ttotal,
+    Tprimary_onelayer,
+    one_m_W,
+    Wmz_col,
+  )
+  ### //Interpolate new abundances onto the original grid//
   xq = elevation
   spl                                  = make_interp_spline(np.flip(elevation_mixinggrid), np.flip(abundances_mixinggrid, axis=0), k=1)
   new_abundances                       = spl(xq)                                               #[area fraction]
