@@ -902,23 +902,25 @@ def compute_ejecta_mixing(
     n_component    = abundances_2d.shape[1] + 1
   idx_newcomponent = n_component - 1
   ### //Initialize mixing grid//
-  elevation_toplayer    = Tprimary - (dz / 2)                                                #[m]
-  n_depth_fill          = int(abs(elevation_toplayer / dz))
-  elevation_deposit     = np.flip(np.linspace(dz / 2, elevation_toplayer, n_depth_fill + 1)) #[m]
-  elevation_mixinggrid  = np.concatenate((elevation_deposit, mixing_grid))                   #[m]
+  elevation_toplayer   = Tprimary - (dz / 2)                                                #[m]
+  n_depth_fill         = int(abs(elevation_toplayer / dz))
+  elevation_deposit    = np.flip(np.linspace(dz / 2, elevation_toplayer, n_depth_fill + 1)) #[m]
+  elevation_mixinggrid = np.concatenate((elevation_deposit, mixing_grid))                   #[m]
   # Correct grid for surface elevation
-  elevation_mixinggrid    += surface_elevation                                                        #[m]
-  elevation_initialsurface = surface_elevation                                                        #[m] -- elevation of the surface before any of this basin's ejecta is deposited
+  elevation_mixinggrid    += surface_elevation #[m]
+  elevation_initialsurface = surface_elevation #[m] -- elevation of the surface before any of this basin's ejecta is deposited
   ### //Initialize preexisting abundances on the mixing grid//
   idx_mixingzone        = np.where((elevation_mixinggrid > (elevation_initialsurface - zmax)) & (elevation_mixinggrid < elevation_initialsurface))[0] #starting indices of the moving mixing-zone window for `elevation_mixinggrid`
-  abundances_mixinggrid = np.zeros((len(elevation_mixinggrid), n_component)) #[area fraction]
-  spl                   = make_interp_spline(np.flip(elevation), np.flip(abundances_2d, axis=0), k=1)
+  abundances_mixinggrid = np.zeros((len(elevation_mixinggrid), n_component)) #[area fraction] -- has one more column than `abundances_2d` for new component
   xq                    = elevation_mixinggrid[idx_mixingzone]
+  spl                   = make_interp_spline(np.flip(elevation), np.flip(abundances_2d, axis=0), k=1)
   abundances_mixinggrid[idx_mixingzone, :idx_newcomponent] = spl(xq)         #[area fraction] -- abundances of preexisting components within mixing zone for the first layer
   # Zero out abundances above the current mixing zone, because it extends to the surface
-  abundances_mixinggrid = np.where((elevation_mixinggrid > elevation.max())[:, None], 0.0, abundances_mixinggrid) #[area fraction]
+  above_originalgrid    = elevation_mixinggrid > elevation.max()
+  abundances_mixinggrid = np.where(above_originalgrid[:, None], 0.0, abundances_mixinggrid) #[area fraction]
   # Zero out abundances below the current mixing zone to match the behavior of `np.interp` with `left=None`
-  abundances_mixinggrid = np.where((elevation_mixinggrid < elevation.min())[:, None], abundances_mixinggrid[idx_mixingzone[-1], :], abundances_mixinggrid) #[area fraction]
+  below_originalgrid    = elevation_mixinggrid < elevation.min()
+  abundances_mixinggrid = np.where(below_originalgrid[:, None], abundances_mixinggrid[idx_mixingzone[-1], :], abundances_mixinggrid) #[area fraction]
   ### //Compute vertical mixing//
   # Convert fancy index to slice for fast view-based access (mixing zone is always contiguous)
   mz_start        = int(idx_mixingzone[0])
@@ -945,19 +947,17 @@ def compute_ejecta_mixing(
     mz_start -= 1
     mz_stop  -= 1
   ### //Stack the new/mixed deposit on top of the original elevation grid and interpolate results onto that grid//
-  # Identify elevations outside the mixing zone where extrapolation would be invalid
-  deep_mask      = elevation < np.min(elevation_mixinggrid) # below mixing zone on the original elevation grid
-  new_abundances = np.zeros((len(elevation), n_component))  #[area fraction]
   # Interpolate onto the original grid
-  deposit_top                          = surface_elevation + Tprimary
-  above_deposit                        = elevation > deposit_top
+  xq = elevation
   spl                                  = make_interp_spline(np.flip(elevation_mixinggrid), np.flip(abundances_mixinggrid, axis=0), k=1)
-  xq                                   = elevation
   new_abundances                       = spl(xq)                                               #[area fraction]
   # Zero above the deposit top (where no material has been placed yet)
+  deposit_top                          = surface_elevation + Tprimary
+  above_deposit                        = elevation > deposit_top
   new_abundances                       = np.where(above_deposit[:, None], 0.0, new_abundances) #[area fraction]
   # Below the mixing zone, restore original abundances for preexisting components
-  new_abundances[:, :idx_newcomponent] = np.where(deep_mask[:, None], abundances_2d[:, :idx_newcomponent], new_abundances[:, :idx_newcomponent]) #[area fraction]
+  below_mixingzone                     = elevation < np.min(elevation_mixinggrid)
+  new_abundances[:, :idx_newcomponent] = np.where(below_mixingzone[:, None], abundances_2d[:, :idx_newcomponent], new_abundances[:, :idx_newcomponent]) #[area fraction]
   return new_abundances
 
 
@@ -1096,7 +1096,7 @@ def build_global_mixing_dataset(
   elevation: np.ndarray = None,
   ejecta_model: dict | EjectaModel = None,
   preimpact_label: str = None,
-  verbose: int = 0
+  verbose: int = 1
 ) -> xr.Dataset:
   """
   Run a vertical mixing simulation at all points on a coordinate grid given a chronological sequence of basin-forming impacts.
@@ -1136,17 +1136,21 @@ def build_global_mixing_dataset(
     },
   )
   all_profiles = []
-  for lat, lon in tqdm([(lat, lon) for lat in grid_lats for lon in grid_lons], desc="Computing profiles at each grid point", disable=verbose < 1):
-    ds_profile = compute_ejecta_mixing_multi_basin(
-      ds_basin = ds_basin,
-      profile_lat = lat,
-      profile_lon = lon,
-      elevation = elevation,
-      ejecta_model = ejecta_model,
-      skip_intermediate_abundance = True,
-      preimpact_label = preimpact_label
-    )
-    all_profiles.append(ds_profile)
+  with warnings.catch_warnings():
+    warnings.filterwarnings("ignore", message="`rSOI` is set")
+    warnings.filterwarnings("ignore", message="divide by zero encountered in divide")
+    warnings.filterwarnings("ignore", message="invalid value encountered in divide")
+    for lat, lon in tqdm([(lat, lon) for lat in grid_lats for lon in grid_lons], desc="Computing profiles at each grid point", disable=verbose < 1):
+      ds_profile = compute_ejecta_mixing_multi_basin(
+        ds_basin = ds_basin,
+        profile_lat = lat,
+        profile_lon = lon,
+        elevation = elevation,
+        ejecta_model = ejecta_model,
+        skip_intermediate_abundance = True,
+        preimpact_label = preimpact_label
+      )
+      all_profiles.append(ds_profile)
   ds_profiles = xr.merge((ds_profiles, *all_profiles), join='outer')
   return ds_profiles
 
