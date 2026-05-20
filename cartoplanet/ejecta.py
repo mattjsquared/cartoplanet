@@ -881,6 +881,8 @@ def compute_ejecta_mixing(
       return np.zeros((len(elevation), 1))
     else:
       return np.column_stack([abundances, np.zeros(len(elevation))])
+  ### //Import interpolation function//
+  from scipy.interpolate import make_interp_spline
   ### //Fetch parameters from kernel//
   Tprimary               = kernel['primary_thickness']      #[m]
   Wmz_onelayer           = kernel['Wmz_onelayer']           #[area fraction]
@@ -890,12 +892,6 @@ def compute_ejecta_mixing(
   Tprimary_onelayer      = kernel['Tprimary_onelayer']      #[m]
   N_layers               = kernel['N_layers']
   zmax                   = kernel['zmax']                   #[m]
-  ### //Define interpolation helper function to prevent invalid values//
-  def _safe_interp(x, xp, fp, left=None, right=None):
-    result = np.interp(x, xp, fp, left=left, right=right)
-    if np.any(result > 1) or np.any(result < 0):
-      raise ValueError("Interpolation error: Unexpected extrapolation, or data values are not between 0 and 1.")
-    return result
   ### //Initialize mixing components//
   elevation = np.asarray(elevation) #[m]
   if abundances is None or (hasattr(abundances, 'size') and abundances.size == 0):
@@ -914,24 +910,29 @@ def compute_ejecta_mixing(
   elevation_mixinggrid    += surface_elevation                                                        #[m]
   elevation_initialsurface = surface_elevation                                                        #[m] -- elevation of the surface before any of this basin's ejecta is deposited
   ### //Initialize preexisting abundances on the mixing grid//
-  idx_mixingzone                             = np.where((elevation_mixinggrid > (elevation_initialsurface - zmax)) & (elevation_mixinggrid < elevation_initialsurface))[0] #starting indices of the moving mixing-zone window for `elevation_mixinggrid`
-  abundances_mixinggrid                      = np.zeros((len(elevation_mixinggrid), n_component)) #[area fraction]
-  for k in range(idx_newcomponent): #initialize the first layer's mixing zone with preexisting abundances
-    abundances_mixinggrid[idx_mixingzone, k] = _safe_interp(elevation_mixinggrid[idx_mixingzone], np.flip(elevation), np.flip(abundances_2d[:, k]), right=0) #[area fraction] -- abundances of preexisting components within mixing zone for the first layer
+  idx_mixingzone        = np.where((elevation_mixinggrid > (elevation_initialsurface - zmax)) & (elevation_mixinggrid < elevation_initialsurface))[0] #starting indices of the moving mixing-zone window for `elevation_mixinggrid`
+  abundances_mixinggrid = np.zeros((len(elevation_mixinggrid), n_component)) #[area fraction]
+  spl                   = make_interp_spline(np.flip(elevation), np.flip(abundances_2d, axis=0), k=1)
+  xq                    = elevation_mixinggrid[idx_mixingzone]
+  abundances_mixinggrid[idx_mixingzone, :idx_newcomponent] = spl(xq)         #[area fraction] -- abundances of preexisting components within mixing zone for the first layer
+  # Zero out abundances above the current mixing zone, because it extends to the surface
+  abundances_mixinggrid = np.where((elevation_mixinggrid > elevation.max())[:, None], 0.0, abundances_mixinggrid) #[area fraction]
+  # Zero out abundances below the current mixing zone to match the behavior of `np.interp` with `left=None`
+  abundances_mixinggrid = np.where((elevation_mixinggrid < elevation.min())[:, None], abundances_mixinggrid[idx_mixingzone[-1], :], abundances_mixinggrid) #[area fraction]
   ### //Compute vertical mixing//
   # Convert fancy index to slice for fast view-based access (mixing zone is always contiguous)
-  mz_start = int(idx_mixingzone[0])
-  mz_stop  = int(idx_mixingzone[-1]) + 1
-  n_mix    = mz_stop - mz_start
-  Wmz_col  = Wmz_onelayer[:n_mix, None]                                              #(n_mix, 1) for broadcasting
-  dz_Wmz   = dz * Wmz_col                                                            #pre-multiply constant factors
-  one_m_W  = 1.0 - Wmz_col                                                           #pre-compute (1 - W)
+  mz_start        = int(idx_mixingzone[0])
+  mz_stop         = int(idx_mixingzone[-1]) + 1
+  n_mix           = mz_stop - mz_start
+  Wmz_col         = Wmz_onelayer[:n_mix, None]                                        #(n_mix, 1) for broadcasting
+  dz_Wmz          = dz * Wmz_col                                                      #pre-multiply constant factors
+  one_m_W         = 1.0 - Wmz_col                                                     #pre-compute (1 - W)
   Ttotal_onelayer = Tprimary_onelayer + Texcavated_onelayer                           #[m] -- constant across layers
   inv_Ttotal      = 1.0 / Ttotal_onelayer                                             #pre-compute reciprocal
   newfrac_k       = np.empty(n_component)                                             #pre-allocate once
   for i in range(N_layers): #emplace primary ejecta layer-by-layer
     # Compute excavated thicknesses for ALL components at once (slice = view, no copy)
-    window = abundances_mixinggrid[mz_start:mz_stop]                                  #(n_mix, n_component) view
+    window       = abundances_mixinggrid[mz_start:mz_stop]                           #(n_mix, n_component) view
     Texcavated_k = (dz_Wmz * window).sum(axis=0)                                     #(n_component,)
     # Compute deposited fractions
     newfrac_k[:idx_newcomponent] = Texcavated_k[:idx_newcomponent] * inv_Ttotal
@@ -948,15 +949,15 @@ def compute_ejecta_mixing(
   deep_mask      = elevation < np.min(elevation_mixinggrid) # below mixing zone on the original elevation grid
   new_abundances = np.zeros((len(elevation), n_component))  #[area fraction]
   # Interpolate onto the original grid
-  deposit_top   = surface_elevation + Tprimary
-  above_deposit = elevation > deposit_top
-  for k in range(n_component):
-    new_abundances[:, k] = _safe_interp(elevation, np.flip(elevation_mixinggrid), np.flip(abundances_mixinggrid[:, k])) #[area fraction]
-    # Zero above the deposit top (where no material has been placed yet)
-    new_abundances[above_deposit, k] = 0.0
-    # Below the mixing zone, restore original abundances for preexisting components
-    if k < idx_newcomponent:
-      new_abundances[:, k] = np.where(deep_mask, abundances_2d[:, k], new_abundances[:, k])
+  deposit_top                          = surface_elevation + Tprimary
+  above_deposit                        = elevation > deposit_top
+  spl                                  = make_interp_spline(np.flip(elevation_mixinggrid), np.flip(abundances_mixinggrid, axis=0), k=1)
+  xq                                   = elevation
+  new_abundances                       = spl(xq)                                               #[area fraction]
+  # Zero above the deposit top (where no material has been placed yet)
+  new_abundances                       = np.where(above_deposit[:, None], 0.0, new_abundances) #[area fraction]
+  # Below the mixing zone, restore original abundances for preexisting components
+  new_abundances[:, :idx_newcomponent] = np.where(deep_mask[:, None], abundances_2d[:, :idx_newcomponent], new_abundances[:, :idx_newcomponent]) #[area fraction]
   return new_abundances
 
 
@@ -966,6 +967,7 @@ def compute_ejecta_mixing_multi_basin(
     profile_lon: float,
     elevation: np.ndarray = None,
     ejecta_model: dict | EjectaModel = None,
+    skip_intermediate_abundance: bool = False,
     preimpact_label: str = None,
     verbose: bool = False,
 ) -> xr.Dataset:
@@ -989,8 +991,8 @@ def compute_ejecta_mixing_multi_basin(
     Elevation grid in meters for the vertical mixing profile. If `None`, elevation grid will be handled automatically.
   ejecta_model : dict or EjectaModel
     If dict, can contain keys as described in the EjectaModel class. If `None`, default parameters from the EjectaModel class will be used.
-  return_caches : bool
-    Whether to return a copy of `ds_basin` with pre-computed SOI caches for each basin. Default is False.
+  skip_intermediate_abundance : bool
+    If True, skip computation of `abundance_iflast`. Default is False.
   preimpact_label : str, optional
     Name for the mixing component corresponding to local materials that predate the first impact. If `None`, defaults to 'preimpact'.
   verbose : bool
@@ -1002,12 +1004,11 @@ def compute_ejecta_mixing_multi_basin(
     Dataset containing the vertical mixing profile at the specified location, with dimensions:
     - lat       : latitude of the profile point (degrees)
     - lon       : longitude of the profile point (degrees)
-    - elevation : elevation of grid points w.r.t. pre-impact surface (m)
     - basin     : name of each basin involved in mixing, plus "preimpact"
+    - elevation : elevation of grid points w.r.t. pre-impact surface (m)
     and variables:
     - total_thickness   : total thickness of primary ejecta from all basins at this location
     - primary_thickness : thickness of primary ejecta from each basin at this location
-    - primary_thickness_cumulative : cumulative thickness of primary ejecta from this and all previous basins at this location
     - abundance         : area or volume fraction of each basin's primary ejecta at each elevation
     - abundance_iflast  : area or volume fraction of each basin's primary ejecta at each elevation if there were no subsequent impacts
   """
@@ -1063,7 +1064,7 @@ def compute_ejecta_mixing_multi_basin(
       'elevation': elevation, #[m]
     },
   )
-  ds_profile = ds_profile.assign(primary_thickness_cumulative = lambda ds: ds['primary_thickness'].cumsum(dim='basin'))
+  primary_thickness_cumulative = ds_profile['primary_thickness'].cumsum(dim='basin')
   ### //Run the chronological vertical mixing//
   abundances          = np.where(elevation[:, None] < 0, 1.0, 0.0)
   abundances_iflast   = abundances.copy()
@@ -1076,12 +1077,15 @@ def compute_ejecta_mixing_multi_basin(
     cache             = ds_caches.sel(basin=b)['soi_cache'].item() #fetch the pre-computed SOI cache for this basin
     kernel            = build_mixing_kernel(cache, 0)
     basin             = ds_profile.sel(basin=b)
-    abundances        = compute_ejecta_mixing(kernel, elevation, abundances, surface_elevation=basin['primary_thickness_cumulative'].item()-basin['primary_thickness'].item())
-    abundances_iflast_thisbasin = abundances[:, -1].copy()[:, None]
-    abundances_iflast_thisbasin[abundances_iflast_thisbasin == 0] = np.nan
-    abundances_iflast = np.concatenate((abundances_iflast, abundances_iflast_thisbasin), axis=1)
-  for var_name, var in zip(['abundance', 'abundance_iflast'], [abundances, abundances_iflast]):
-    ds_profile[var_name] = (('lat', 'lon', 'basin', 'elevation'), np.reshape(var.T, (1, 1, var.shape[1], var.shape[0])))
+    abundances        = compute_ejecta_mixing(kernel, elevation, abundances, surface_elevation=primary_thickness_cumulative.sel(basin=b).item()-basin['primary_thickness'].item())
+    if not skip_intermediate_abundance:
+      abundances_iflast_thisbasin = abundances[:, -1].copy()[:, None]
+      abundances_iflast_thisbasin[abundances_iflast_thisbasin == 0] = np.nan
+      abundances_iflast = np.concatenate((abundances_iflast, abundances_iflast_thisbasin), axis=1)
+  ds_profile['abundance'] = (('lat', 'lon', 'basin', 'elevation'), np.reshape(abundances.T, (1, 1, abundances.shape[1], abundances.shape[0])))
+  if not skip_intermediate_abundance:
+     ds_profile['abundance_iflast'] = (('lat', 'lon', 'basin', 'elevation'), np.reshape(abundances_iflast.T, (1, 1, abundances_iflast.shape[1], abundances_iflast.shape[0])))
+  ds_profile['abundance'] = ds_profile['abundance'].where(ds_profile['elevation'] <= ds_profile['total_thickness'], np.nan)
   return ds_profile
 
 
@@ -1139,17 +1143,39 @@ def build_global_mixing_dataset(
       profile_lon = lon,
       elevation = elevation,
       ejecta_model = ejecta_model,
+      skip_intermediate_abundance = True,
       preimpact_label = preimpact_label
     )
-    ds_profile = ds_profile.drop(['abundance_iflast', 'primary_thickness_cumulative'])
     all_profiles.append(ds_profile)
   ds_profiles = xr.merge((ds_profiles, *all_profiles), join='outer')
   return ds_profiles
 
 
-def _worker_mixing_profile(args):
+_worker_static = {}
+
+def _worker_init(
+    ds_basin: xr.Dataset,
+    elevation: np.ndarray,
+    ejecta_model: dict | EjectaModel,
+    preimpact_label: str,
+    verbose: int
+) -> None:
+  """Initializer for worker processes in parallel vertical mixing. Not intended for external use."""
+  _worker_static['ds_basin']        = ds_basin
+  _worker_static['elevation']       = elevation
+  _worker_static['ejecta_model']    = ejecta_model
+  _worker_static['preimpact_label'] = preimpact_label
+  _worker_static['verbose']         = verbose
+  return
+
+def _worker_mixing_profile(args: tuple) -> tuple:
   """Helper function for parallel processing of mixing profiles. Not intended for external use."""
-  i_lat, i_lon, lat, lon, ds_basin, elevation, ejecta_model, preimpact_label, verbose = args
+  i_lat, i_lon, lat, lon = args
+  ds_basin        = _worker_static['ds_basin']
+  elevation       = _worker_static['elevation']
+  ejecta_model    = _worker_static['ejecta_model']
+  preimpact_label = _worker_static['preimpact_label']
+  verbose         = _worker_static['verbose']
   with warnings.catch_warnings():
     warnings.filterwarnings("ignore", message="`rSOI` is set")
     warnings.filterwarnings("ignore", message="divide by zero encountered in divide")
@@ -1160,9 +1186,10 @@ def _worker_mixing_profile(args):
       profile_lon = lon,
       elevation = elevation,
       ejecta_model = ejecta_model,
+      skip_intermediate_abundance = True,
       preimpact_label = preimpact_label,
       verbose = verbose,
-    ).drop(['abundance_iflast', 'primary_thickness_cumulative'])
+    )
   data = (
     os.getpid(),
     i_lat, i_lon,
@@ -1216,7 +1243,7 @@ def build_global_mixing_dataset_parallel(
   from concurrent.futures import ProcessPoolExecutor, as_completed
   ds_sorted = ds_basin.sortby('order')
   tasks = [
-    (i_lat, i_lon, lat, lon, ds_sorted, elevation, ejecta_model, preimpact_label, verbose-1) 
+    (i_lat, i_lon, lat, lon) 
     for i_lat, lat in enumerate(grid_lats) 
     for i_lon, lon in enumerate(grid_lons)
   ]
@@ -1227,7 +1254,10 @@ def build_global_mixing_dataset_parallel(
   total_thickness   = np.zeros((nlat, nlon))
   primary_thickness = np.zeros((nlat, nlon, nbasin))
   abundance         = np.zeros((nlat, nlon, nbasin, nelevation))
-  with ProcessPoolExecutor() as executor:
+  with ProcessPoolExecutor(
+    initializer = _worker_init,
+    initargs = (ds_sorted, elevation, ejecta_model, preimpact_label, verbose-1)
+  ) as executor:
     if verbose > 0:
       print(f"{executor._max_workers} workers available for parallel vertical mixing.")
     futures = [executor.submit(_worker_mixing_profile, t) for t in tasks]
@@ -1253,6 +1283,7 @@ def build_global_mixing_dataset_parallel(
       'elevation': elevation,
     }
   )
+  ds_profiles = ds_profiles.sortby('elevation', ascending=True)
   return ds_profiles
 
 
