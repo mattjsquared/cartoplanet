@@ -23,6 +23,7 @@ dependencies:
   - rasterio
   - scikit-image
   - pyshtools
+  - numba
   - pyinterp
   - xESMF
   - setuptools
