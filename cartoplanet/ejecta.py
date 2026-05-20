@@ -1,11 +1,9 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import xarray as xr
-import pandas as pd
 import copy, warnings, functools, os
 
-from scipy.integrate import quad, cumulative_simpson
-from scipy.optimize import root_scalar
+from scipy.integrate import cumulative_simpson
 from numba import njit
 from tqdm import tqdm
 from cartoplanet import config
@@ -14,7 +12,7 @@ body = config['BODY']['body']
 TEST = True
 
 
-### General utility
+### //General utility//
 def great_circle_distance(lat1, lon1, lat2, lon2, R=config.getfloat(body, "R0")/1e3, in_degrees=True):
   """
   Compute great-circle distance on a sphere.
@@ -45,6 +43,7 @@ def great_circle_distance(lat1, lon1, lat2, lon2, R=config.getfloat(body, "R0")/
   return 2 * R * np.arcsin(np.sqrt(a))
 
 
+### //Validation functions -- compare against output from equivalent ejecta_benchmark.py functions//
 def Xie_figure5(grid=False) -> tuple:
   """
   Code to reproduce Figure 5 of Xie et al. (2020):
@@ -225,7 +224,7 @@ def Xie_figure10c(grid=False) -> tuple:
   return ds_profile
 
 
-### Backend for mass-continuous ballistic sedimentation
+### //Backend for mass-continuous ballistic sedimentation (without vertical mixing)//
 class EjectaModel:
   def __init__(
     self,
@@ -764,7 +763,7 @@ def get_coverage_depth(
   return depths
 
 
-### Vertical mixing from ballistic sedimentation
+### //Vertical mixing from ballistic sedimentation//
 def build_mixing_kernel(
     cache: dict,
     i_soi: int,
@@ -1330,7 +1329,7 @@ def build_global_mixing_dataset_parallel(
   return ds_profiles
 
 
-### Compute 1D radial profiles of ejecta thickness
+### //Ejecta deposit interpolation//
 def compute_thickness_1D(
   ds_basin: xr.Dataset,
   nSOI: int = 20,
@@ -1398,7 +1397,6 @@ def compute_thickness_1D(
   return dist_km, thickness_primary, thickness_local, thickness_total
 
 
-### **2D interpolation of 1D results**
 def compute_thickness_2D(clat, clon, d1, p1, l1, t1, lat_grid, lon_grid, R0=config.getfloat(body, 'R0')):
   """
   
@@ -1410,7 +1408,7 @@ def compute_thickness_2D(clat, clon, d1, p1, l1, t1, lat_grid, lon_grid, R0=conf
   return d2, p2, l2, t2
 
 
-# Multi-basin processing utility
+### //Global ejecta/megaregolith dataset assembly//
 def build_global_ejecta_dataset(
   ds_in: xr.Dataset,
   nSOI: int = 20,
@@ -1523,7 +1521,6 @@ def build_global_ejecta_dataset(
   return ds
 
 
-# Post-process a global multi-basin dataset to simulate megaregolith compaction
 def global_ejecta_compacted_ordered(
     ds: xr.Dataset,
     ordered_basins: list[str],
