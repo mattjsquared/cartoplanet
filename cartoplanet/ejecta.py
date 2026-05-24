@@ -10,6 +10,7 @@ from cartoplanet import config
 
 body = config['BODY']['body']
 TEST = True
+PRECOMPUTE_SOI = False
 
 
 ### //General utility//
@@ -760,7 +761,7 @@ def precompute_SOI_xarray(
     },
     attrs = {
       # SOI- and basin-independent objects
-      'ejecta_model_b': ejecta_model.b,
+      'ejecta_model': ejecta_model,
     }
   )
   return ds_cache
@@ -792,9 +793,9 @@ def compute_central_effective_depth(                                 #d_eff (Eq.
   if isinstance(cache, dict):
     pre_frag_radius          = cache['pre_frag_radius']
     exp_sec_transient_radius = cache['exp_sec_transient_radius']
-    pre_sec1                 = cache['pre_sec_transient_radius1'][i_soi]
-    pre_sec2                 = cache['pre_sec_transient_radius2'][i_soi]
-    pre_deff                 = cache['pre_central_effective_depth'][i_soi]
+    pre_sec1                 = np.atleast_1d(cache['pre_sec_transient_radius1'])[i_soi]
+    pre_sec2                 = np.atleast_1d(cache['pre_sec_transient_radius2'])[i_soi]
+    pre_deff                 = np.atleast_1d(cache['pre_central_effective_depth'])[i_soi]
   else: ##TODO: Need to refactor everything to handle caches more smoothly -- right now the xr compatibility below assumes that the cache is length-1
     pre_frag_radius          = cache['pre_frag_radius'].item()
     exp_sec_transient_radius = cache['exp_sec_transient_radius'].item()
@@ -852,14 +853,14 @@ def compute_coverage_kernel(
   if isinstance(soi_cache, dict):
     pre_frag_radius = soi_cache['pre_frag_radius']
     exp_sec_transient_radius = soi_cache['exp_sec_transient_radius']
-    ml       = soi_cache['mass_lower'][i_soi]
-    mh       = soi_cache['mass_upper'][i_soi]
-    C        = soi_cache['mass_norm_constant'][i_soi]
-    S        = soi_cache['soi_area'][i_soi]
-    pthick   = soi_cache['thickness_primary'][i_soi]
-    pre_sec1 = soi_cache['pre_sec_transient_radius1'][i_soi]
-    pre_sec2 = soi_cache['pre_sec_transient_radius2'][i_soi]
-    pre_deff = soi_cache['pre_central_effective_depth'][i_soi]
+    ml       = np.atleast_1d(soi_cache['mass_lower'])[i_soi]
+    mh       = np.atleast_1d(soi_cache['mass_upper'])[i_soi]
+    C        = np.atleast_1d(soi_cache['mass_norm_constant'])[i_soi]
+    S        = np.atleast_1d(soi_cache['soi_area'])[i_soi]
+    pthick   = np.atleast_1d(soi_cache['thickness_primary'])[i_soi]
+    pre_sec1 = np.atleast_1d(soi_cache['pre_sec_transient_radius1'])[i_soi]
+    pre_sec2 = np.atleast_1d(soi_cache['pre_sec_transient_radius2'])[i_soi]
+    pre_deff = np.atleast_1d(soi_cache['pre_central_effective_depth'])[i_soi]
   else: ##TODO: Need to refactor everything to handle caches more smoothly -- right now the xr compatibility below assumes that the cache is length-1
     pre_frag_radius = soi_cache['pre_frag_radius'].item()
     exp_sec_transient_radius = soi_cache['exp_sec_transient_radius'].item()
@@ -878,7 +879,7 @@ def compute_coverage_kernel(
   try:
     b    = soi_cache['ejecta_model'].b
   except KeyError:
-    b    = soi_cache.attrs['ejecta_model_b']
+    b    = soi_cache.attrs['ejecta_model'].b
   mspace = np.logspace(np.log10(ml), np.log10(mh), int(nmass))
   a      = pre_frag_radius * mspace**(1/3)
   R_at   = a * (pre_sec1*a + pre_sec2)**(exp_sec_transient_radius)
@@ -1044,8 +1045,8 @@ def build_mixing_kernel(
   """
   ### //Fetch parameters from cache for this SOI//
   if isinstance(cache, dict):
-    pthick = cache['thickness_primary'][i_soi] #[m]
-    mupper = cache['mass_upper'][i_soi]        #[g]
+    pthick = np.atleast_1d(cache['thickness_primary'])[i_soi] #[m]
+    mupper = np.atleast_1d(cache['mass_upper'])[i_soi]        #[g]
   else: ##TODO: Need to refactor everything to handle caches more smoothly -- right now the xr compatibility below assumes that the cache is length-1
     pthick = cache['thickness_primary'].item() #[m]
     mupper = cache['mass_upper'].item()        #[g]
@@ -1381,9 +1382,11 @@ def compute_ejecta_mixing_multi_basin(
 
 
 def compute_ejecta_mixing_multi_basin_precached(
-    ds_source: xr.Dataset,
+    cache: dict,
+    basins: list,
     profile_lat: float,
     profile_lon: float,
+    ejecta_model:EjectaModel,
     elevation: np.ndarray = None,
     skip_intermediate_abundance: bool = False,
     preimpact_label: str = None,
@@ -1394,16 +1397,15 @@ def compute_ejecta_mixing_multi_basin_precached(
 
   Parameters
   ----------
-  ds_source : xr.Dataset
-    Precomputed per-basin ballistic sedimentation parameters for the given SOI, with dimensions:
-    - lat   : latitude of the profile point (degrees)
-    - lon   : longitude of the profile point (degrees)
-    - basin : name of each basin
-    and variables:
-    - order             : (basin,) stratigraphic order of each basin (ascending)
-    - thickness_primary : (lat, lon, basin) thickness of primary ejecta from each basin at this SOI (m)
+  cache : dict
+    Precomputed per-basin ballistic sedimentation parameters for the given SOI, with the same keys as the data_vars returned by `precompute_SOI_xarray()`.
+    Must be sorted by 'order' in ascending order (oldest -> youngest).
+  basins : list
+    List of basin names corresponding to the arrays in `cache`. Must be in the same order as the 'basin' dimension of `cache`.
   profile_lat, profile_lon : float
     Coordinates of the point at which to compute the vertical mixing profile.
+  ejecta_model : EjectaModel
+    EjectaModel instance fetched from the output of `precompute_SOI_xarray()`, containing the parameters used for the ballistic sedimentation calculations.
   elevation : optional, ndarray or None
     Elevation grid in meters for the vertical mixing profile. If `None`, elevation grid will be handled automatically.
   skip_intermediate_abundance : bool
@@ -1427,21 +1429,28 @@ def compute_ejecta_mixing_multi_basin_precached(
     - abundance         : area or volume fraction of each basin's primary ejecta at each elevation
     - abundance_iflast  : area or volume fraction of each basin's primary ejecta at each elevation if there were no subsequent impacts
   """
-  ds_cache = ds_source.sel(lat=profile_lat, lon=profile_lon, drop=True)        #fetch the pre-computed SOI cache for this point
+  is_ascending = np.all(cache['order'][:-1] <= cache['order'][1:])
+  if not is_ascending:
+    raise ValueError("The precomputed SOI dataset is not sorted in ascending order by 'order'.")
   ### //Search for and handle any basins that overlap this point//
-  basins_desc      = ds_cache.sortby('order', ascending=False)['basin'].values #sort from youngest -> oldest to efficiently break at the youngest overlapping basin, if necessary
-  cutoff_order     = ds_cache['order'].min().item() - 1                        #set the default cutoff earlier than any actual basin in the dataset
-  for b in tqdm(basins_desc, desc="Pre-computing basin SOI caches", disable=verbose<1):
-    basin          = ds_cache.sel(basin=b)
-    if basin['dist_km'].item() < basin['R'].item(): ## TODO: should this use R or Rat, or something else? I'm assuming all basins would reset stratigraphy but that wouldn't necessarily be true near the rim
+  idx_basins   = np.arange(len(basins))
+  cutoff_order = cache['order'].min() - 1                               #set the default cutoff earlier than any actual basin in the dataset
+  for idx in tqdm(
+    np.flip(idx_basins), 
+    desc    = "Searching basins for a stratigraphic reset", 
+    disable = verbose<2
+  ):
+    rSOI_b  = cache['dist_km'][idx]
+    R_b     = cache['R'][idx]
+    order_b = cache['order'][idx]
+    if rSOI_b < R_b: ## TODO: should this use R or Rat, or something else? I'm assuming all basins would reset stratigraphy but that wouldn't necessarily be true near the rim
       # This point is inside the rim of this basin, so all previous ejecta is erased and none is deposited here by this basin; break
-      cutoff_order = basin['order'].item()
+      cutoff_order = order_b
       break
-  ds_cache['thickness_primary'] = ds_cache['thickness_primary'].where(
-    (ds_cache['order'] > cutoff_order) & np.isfinite(ds_cache['thickness_primary']), 
-    0.0
-  ) #[m] -- set thickness to zero for basins that are stratigraphically reset or out of bounds
-  Tprimary_total                = ds_cache['thickness_primary'].sum() #[m]
+  nonzero_basins               = (cache['order'] > cutoff_order) & np.isfinite(cache['thickness_primary'])
+  cache['thickness_primary']   = np.where(nonzero_basins, cache['thickness_primary'], 0.0) #[m] -- set thickness to zero for basins that are stratigraphically reset or out of bounds
+  Tprimary_total               = cache['thickness_primary'].sum() #[m]
+  thickness_primary_cumulative = np.cumsum(cache['thickness_primary']) #[m]
   ### //Set up the arrays//
   # Set up the elevation grid
   if elevation is None:
@@ -1452,44 +1461,49 @@ def compute_ejecta_mixing_multi_basin_precached(
     elevation       = np.concatenate((np.flip(elevation_above), elevation_below)) #[m]
   else:
     elevation       = np.asarray(elevation)                                       #[m]
-  # Sort the basins ascending to loop through in chronological order
-  ds_cache = ds_cache.sortby('order', ascending=True)
-  # Define the output dataset
-  pre_lbl    = preimpact_label or 'preimpact'
-  ds_profile = xr.Dataset(
-    {
-      'thickness_total'  : (('lat', 'lon'), np.atleast_2d(Tprimary_total)), #[m]
-      'thickness_primary': (('lat', 'lon', 'basin'), np.reshape(np.concatenate(([0], ds_cache['thickness_primary'].values)), (1, 1, -1))), #[m]
-    },
-    coords = {
-      'lat'      : np.asarray([profile_lat]),
-      'lon'      : np.asarray([profile_lon]),
-      'basin'    : np.concatenate(([pre_lbl], ds_cache['basin'].values)),
-      'elevation': elevation, #[m]
-    },
-  )
-  thickness_primary_cumulative = ds_profile['thickness_primary'].cumsum(dim='basin')
   ### //Run the chronological vertical mixing//
-  abundances          = np.where(elevation[:, None] < 0, 1.0, 0.0)
-  abundances_iflast   = abundances.copy()
-  for b in tqdm(ds_cache['basin'].values, desc="Computing each basin's vertical mixing", disable=verbose<1):
-    cache_b = ds_cache.sel(basin=[b], drop=False)
-    if (cache_b['order'].item() <= cutoff_order):
+  abundances        = np.where(elevation[:, None] < 0, 1.0, 0.0)
+  abundances_iflast = abundances.copy()
+  for idx in tqdm(
+    idx_basins,
+    desc        = "Computing each basin's vertical mixing",
+    mininterval = 0.5, 
+    disable     = verbose < 1
+  ):
+    cache_b      = {var: cache[var][idx] for var in cache.keys()}
+    cache_b['ejecta_model'] = ejecta_model
+    reset_b      = cache_b['order'] <= cutoff_order
+    surface_elev = thickness_primary_cumulative[idx] - cache_b['thickness_primary']
+    if reset_b:
       # This basin's ejecta is erased at this point by a later impact; add a zero column and skip the mixing computation
       abundances        = np.column_stack([abundances, np.zeros(len(elevation))])
       abundances_iflast = np.column_stack([abundances_iflast, np.full(len(elevation), np.nan)])
       continue
     kernel       = build_mixing_kernel(cache_b, 0)
-    surface_elev = thickness_primary_cumulative.sel(basin=b).item() - cache_b['thickness_primary'].item()
     abundances   = compute_ejecta_mixing(kernel, elevation, abundances, surface_elevation=surface_elev)
     if not skip_intermediate_abundance:
       abundances_iflast_thisbasin                                   = abundances[:, -1].copy()[:, None]
       abundances_iflast_thisbasin[abundances_iflast_thisbasin == 0] = np.nan
       abundances_iflast                                             = np.concatenate((abundances_iflast, abundances_iflast_thisbasin), axis=1)
-  ds_profile['abundance'] = (('lat', 'lon', 'basin', 'elevation'), np.reshape(abundances.T, (1, 1, abundances.shape[1], abundances.shape[0])))
+  above_surface = elevation > Tprimary_total
+  abundances    = np.where(above_surface[:, None], np.nan, abundances) 
+  # Define the output dataset
+  pre_lbl    = preimpact_label or 'preimpact'
+  ds_profile = xr.Dataset(
+    {
+      'thickness_total'  : (('lat', 'lon'), np.atleast_2d(Tprimary_total)), #[m]
+      'thickness_primary': (('lat', 'lon', 'basin'), np.reshape(np.concatenate(([0], cache['thickness_primary'])), (1, 1, -1))), #[m]
+      'abundance'        : (('lat', 'lon', 'basin', 'elevation'), np.reshape(abundances.T, (1, 1, abundances.shape[1], abundances.shape[0])))
+    },
+    coords = {
+      'lat'      : np.asarray([profile_lat]),
+      'lon'      : np.asarray([profile_lon]),
+      'basin'    : np.concatenate(([pre_lbl], basins)),
+      'elevation': elevation, #[m]
+    },
+  )
   if not skip_intermediate_abundance:
      ds_profile['abundance_iflast'] = (('lat', 'lon', 'basin', 'elevation'), np.reshape(abundances_iflast.T, (1, 1, abundances_iflast.shape[1], abundances_iflast.shape[0])))
-  ds_profile['abundance'] = ds_profile['abundance'].where((ds_profile['elevation'] <= ds_profile['thickness_total']), np.nan)
   return ds_profile
 
 
@@ -1533,12 +1547,17 @@ def build_global_mixing_dataset(
     - thickness_total   : total thickness of primary ejecta + local excavation at each location
     - abundance         : area or volume fraction of each basin's primary ejecta at each elevation
   """
-  ds_caches = precompute_SOI_xarray(
-    ds_basin = ds_basin,
-    grid_lats = grid_lats,
-    grid_lons = grid_lons,
-    ejecta_model = ejecta_model,
-  )
+  with warnings.catch_warnings():
+    warnings.filterwarnings("ignore", message="`rSOI` is set")
+    warnings.filterwarnings("ignore", message="divide by zero encountered in divide")
+    warnings.filterwarnings("ignore", message="invalid value encountered in divide")
+    warnings.filterwarnings("ignore", message="invalid value encountered in sqrt")
+    ds_caches = precompute_SOI_xarray(
+      ds_basin = ds_basin,
+      grid_lats = grid_lats,
+      grid_lons = grid_lons,
+      ejecta_model = ejecta_model,
+    )
   ds_profiles = xr.Dataset(
     coords = {
       'lat': grid_lats,
@@ -1550,7 +1569,13 @@ def build_global_mixing_dataset(
     warnings.filterwarnings("ignore", message="`rSOI` is set")
     warnings.filterwarnings("ignore", message="divide by zero encountered in divide")
     warnings.filterwarnings("ignore", message="invalid value encountered in divide")
-    for lat, lon in tqdm([(lat, lon) for lat in grid_lats for lon in grid_lons], desc="Computing profiles at each grid point", disable=verbose < 1):
+    warnings.filterwarnings("ignore", message="invalid value encountered in sqrt")
+    for lat, lon in tqdm(
+      [(lat, lon) for lat in grid_lats for lon in grid_lons], 
+      desc = "Computing profiles at each grid point",
+      mininterval = 2.0, 
+      disable = verbose < 1
+    ):
       ds_profile = compute_ejecta_mixing_multi_basin_precached(
         ds_source = ds_caches,
         profile_lat = lat,
@@ -1589,16 +1614,25 @@ def _worker_mixing_profile(args: tuple) -> tuple:
     warnings.filterwarnings("ignore", message="`rSOI` is set")
     warnings.filterwarnings("ignore", message="divide by zero encountered in divide")
     warnings.filterwarnings("ignore", message="invalid value encountered in divide")
-    ds_cache = precompute_SOI_xarray(
-      ds_basin = ds_basin,
-      grid_lats = np.atleast_1d(lat),
-      grid_lons = np.atleast_1d(lon),
-      ejecta_model = None,
-    )
+    warnings.filterwarnings("ignore", message="invalid value encountered in sqrt")
+    if PRECOMPUTE_SOI:
+      ds_cache = ds_basin
+      ds_SOI = ds_cache.isel(lat=i_lat, lon=i_lon, drop=True, missing_dims='ignore')
+    else:
+      ds_cache = precompute_SOI_xarray(
+        ds_basin = ds_basin,
+        grid_lats = np.atleast_1d(lat),
+        grid_lons = np.atleast_1d(lon),
+        ejecta_model = None,
+      )
+      ds_SOI = ds_cache.isel(lat=0, lon=0, drop=True, missing_dims='ignore')
+    cache = {var: ds_SOI[var].values for var in ds_SOI.data_vars}
     ds = compute_ejecta_mixing_multi_basin_precached(
-      ds_source = ds_cache,
+      cache = cache,
+      basins = ds_cache['basin'].values,
       profile_lat = lat,
       profile_lon = lon,
+      ejecta_model = ds_cache.attrs['ejecta_model'],
       elevation = elevation,
       skip_intermediate_abundance = True,
       preimpact_label = preimpact_label,
@@ -1659,18 +1693,23 @@ def build_global_mixing_dataset_parallel(
     for i_lat, lat in enumerate(grid_lats) 
     for i_lon, lon in enumerate(grid_lons)
   ]
-  ds_b = ds_basin.sortby('order', ascending=True)
+  ds_basin_chronological = ds_basin.sortby('order', ascending=True)
   t0 = time.time()
-  # with warnings.catch_warnings():
-  #   warnings.filterwarnings("ignore", message="`rSOI` is set")
-  #   warnings.filterwarnings("ignore", message="divide by zero encountered in divide")
-  #   warnings.filterwarnings("ignore", message="invalid value encountered in divide")
-  #   ds_cache = precompute_SOI_xarray(
-  #     ds_basin = ds_basin.sortby('order'),
-  #     grid_lats = grid_lats,
-  #     grid_lons = grid_lons,
-  #     ejecta_model = ejecta_model,
-  #   )
+  with warnings.catch_warnings():
+    warnings.filterwarnings("ignore", message="`rSOI` is set")
+    warnings.filterwarnings("ignore", message="divide by zero encountered in divide")
+    warnings.filterwarnings("ignore", message="invalid value encountered in divide")
+    warnings.filterwarnings("ignore", message="invalid value encountered in sqrt")
+    ds_cache = precompute_SOI_xarray(
+      ds_basin = ds_basin_chronological,
+      grid_lats = grid_lats,
+      grid_lons = grid_lons,
+      ejecta_model = ejecta_model,
+    )
+  if PRECOMPUTE_SOI:
+    ds_b = ds_cache
+  else:
+    ds_b = ds_basin_chronological
   if verbose > 0:
     print(f"Pre-computation completed in {time.time() - t0:.1f} seconds.")
   nbasin     = len(ds_b['basin']) + 1 #+1 for pre-impact component
@@ -1693,7 +1732,13 @@ def build_global_mixing_dataset_parallel(
     used_pids = set()
     if verbose > 0:
       print(f"Futures computed in {time.time() - t2:.1f} seconds.")
-    for f in tqdm(as_completed(futures), total=len(futures), desc="Computing profiles at each grid point (parallel)", disable=verbose<1):
+    for f in tqdm(
+      as_completed(futures), 
+      total = len(futures), 
+      desc = "Computing profiles at each grid point (parallel)", 
+      mininterval = 2.0,
+      disable = verbose<1
+    ):
       pid, i_lat, i_lon, thickness_total_val, thickness_primary_val, abundance_val = f.result()
       used_pids.add(pid)
       thickness_total[i_lat, i_lon]      = thickness_total_val
@@ -1705,16 +1750,15 @@ def build_global_mixing_dataset_parallel(
     {
       'thickness_total':   (('lat', 'lon'), thickness_total),
       'thickness_primary': (('lat', 'lon', 'basin'), thickness_primary),
-      'abundance':         (('lat', 'lon', 'basin', 'elevation'), abundance),
+      'abundance':         (('lat', 'lon', 'basin', 'elevation'), np.flip(abundance, axis=-1)),
     },
     coords = {
       'lat': grid_lats,
       'lon': grid_lons,
       'basin': np.concatenate(([preimpact_label or 'preimpact'], ds_b['basin'].values)),
-      'elevation': elevation,
+      'elevation': np.flip(elevation),
     }
   )
-  ds_profiles = ds_profiles.sortby('elevation', ascending=True)
   return ds_profiles
 
 
