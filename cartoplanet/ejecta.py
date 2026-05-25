@@ -1549,13 +1549,14 @@ def build_global_mixing_dataset(
     - thickness_total   : total thickness of primary ejecta + local excavation at each location
     - abundance         : area or volume fraction of each basin's primary ejecta at each elevation
   """
+  ds_basin_chronological = ds_basin.sortby('order', ascending=True) #sort from oldest -> youngest for chronological processing
   with warnings.catch_warnings():
     warnings.filterwarnings("ignore", message="`rSOI` is set")
     warnings.filterwarnings("ignore", message="divide by zero encountered in divide")
     warnings.filterwarnings("ignore", message="invalid value encountered in divide")
     warnings.filterwarnings("ignore", message="invalid value encountered in sqrt")
     ds_caches = precompute_SOI_xarray(
-      ds_basin = ds_basin,
+      ds_basin = ds_basin_chronological,
       grid_lats = grid_lats,
       grid_lons = grid_lons,
       ejecta_model = ejecta_model,
@@ -1567,23 +1568,33 @@ def build_global_mixing_dataset(
     },
   )
   all_profiles = []
+  cache = {name: da.values for name, da in ds_caches.data_vars.items()}
   with warnings.catch_warnings():
     warnings.filterwarnings("ignore", message="`rSOI` is set")
     warnings.filterwarnings("ignore", message="divide by zero encountered in divide")
     warnings.filterwarnings("ignore", message="invalid value encountered in divide")
     warnings.filterwarnings("ignore", message="invalid value encountered in sqrt")
-    for lat, lon in tqdm(
-      [(lat, lon) for lat in grid_lats for lon in grid_lons], 
+    for i_lat, i_lon, lat, lon in tqdm(
+      [
+        (i_lat, i_lon, lat, lon) 
+        for i_lat, lat in enumerate(grid_lats) 
+        for i_lon, lon in enumerate(grid_lons)
+      ], 
       desc = "Computing profiles at each grid point",
       mininterval = 2.0, 
       disable = verbose < 1
     ):
+      cache_b = {var: arr[i_lat, i_lon, :] if (arr.ndim == 3) else arr for var, arr in cache.items()}
+      basins = ds_basin_chronological['basin'].values
       ds_profile = compute_ejecta_mixing_multi_basin_precached(
-        ds_source = ds_caches,
+        cache = cache_b,
+        basins = basins,
         profile_lat = lat,
         profile_lon = lon,
+        ejecta_model = ds_caches.attrs['ejecta_model'],
         elevation = elevation,
         preimpact_label = preimpact_label,
+        skip_intermediate_abundance = True,
       )
       all_profiles.append(ds_profile)
   ds_profiles = xr.merge((ds_profiles, *all_profiles), join='outer')
