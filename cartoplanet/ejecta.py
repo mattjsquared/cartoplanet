@@ -10,7 +10,7 @@ from cartoplanet import config
 
 body = config['BODY']['body']
 TEST = True
-PRECOMPUTE_SOI = False
+PRECOMPUTE_SOI = True
 
 
 ### //General utility//
@@ -1434,11 +1434,11 @@ def compute_ejecta_mixing_multi_basin_precached(
     raise ValueError("The precomputed SOI dataset is not sorted in ascending order by 'order'.")
   ### //Search for and handle any basins that overlap this point//
   idx_basins   = np.arange(len(basins))
-  cutoff_order = cache['order'].min() - 1                               #set the default cutoff earlier than any actual basin in the dataset
+  cutoff_order = cache['order'].min() - 1 #set the default cutoff earlier than any actual basin in the dataset
   for idx in tqdm(
     np.flip(idx_basins), 
     desc    = "Searching basins for a stratigraphic reset", 
-    disable = verbose<2
+    disable = verbose < 2
   ):
     rSOI_b  = cache['dist_km'][idx]
     R_b     = cache['R'][idx]
@@ -1591,23 +1591,26 @@ def build_global_mixing_dataset(
 _worker_static = {}
 
 def _worker_init(
-    ds_basin: xr.Dataset,
+    basins: xr.Dataset,
     elevation: np.ndarray,
+    ejecta_model: EjectaModel,
     preimpact_label: str,
     verbose: int
 ) -> None:
   """Initializer for worker processes in parallel vertical mixing. Not intended for external use."""
-  _worker_static['ds_basin']        = ds_basin
+  _worker_static['basins']          = basins
   _worker_static['elevation']       = elevation
+  _worker_static['ejecta_model']    = ejecta_model
   _worker_static['preimpact_label'] = preimpact_label
   _worker_static['verbose']         = verbose
   return
 
 def _worker_mixing_profile(args: tuple) -> tuple:
   """Helper function for parallel processing of mixing profiles. Not intended for external use."""
-  i_lat, i_lon, lat, lon = args
-  ds_basin        = _worker_static['ds_basin']
+  i_lat, i_lon, lat, lon, cache = args
+  basins          = _worker_static['basins']
   elevation       = _worker_static['elevation']
+  ejecta_model    = _worker_static['ejecta_model']
   preimpact_label = _worker_static['preimpact_label']
   verbose         = _worker_static['verbose']
   with warnings.catch_warnings():
@@ -1615,24 +1618,12 @@ def _worker_mixing_profile(args: tuple) -> tuple:
     warnings.filterwarnings("ignore", message="divide by zero encountered in divide")
     warnings.filterwarnings("ignore", message="invalid value encountered in divide")
     warnings.filterwarnings("ignore", message="invalid value encountered in sqrt")
-    if PRECOMPUTE_SOI:
-      ds_cache = ds_basin
-      ds_SOI = ds_cache.isel(lat=i_lat, lon=i_lon, drop=True, missing_dims='ignore')
-    else:
-      ds_cache = precompute_SOI_xarray(
-        ds_basin = ds_basin,
-        grid_lats = np.atleast_1d(lat),
-        grid_lons = np.atleast_1d(lon),
-        ejecta_model = None,
-      )
-      ds_SOI = ds_cache.isel(lat=0, lon=0, drop=True, missing_dims='ignore')
-    cache = {var: ds_SOI[var].values for var in ds_SOI.data_vars}
     ds = compute_ejecta_mixing_multi_basin_precached(
       cache = cache,
-      basins = ds_cache['basin'].values,
+      basins = basins,
       profile_lat = lat,
       profile_lon = lon,
-      ejecta_model = ds_cache.attrs['ejecta_model'],
+      ejecta_model = ejecta_model,
       elevation = elevation,
       skip_intermediate_abundance = True,
       preimpact_label = preimpact_label,
@@ -1688,11 +1679,6 @@ def build_global_mixing_dataset_parallel(
     - abundance         : area or volume fraction of each basin's primary ejecta at each elevation
   """
   from concurrent.futures import ProcessPoolExecutor, as_completed
-  tasks = [
-    (i_lat, i_lon, lat, lon) 
-    for i_lat, lat in enumerate(grid_lats) 
-    for i_lon, lon in enumerate(grid_lons)
-  ]
   ds_basin_chronological = ds_basin.sortby('order', ascending=True)
   t0 = time.time()
   with warnings.catch_warnings():
@@ -1706,13 +1692,20 @@ def build_global_mixing_dataset_parallel(
       grid_lons = grid_lons,
       ejecta_model = ejecta_model,
     )
-  if PRECOMPUTE_SOI:
-    ds_b = ds_cache
-  else:
-    ds_b = ds_basin_chronological
+  ejecta_model_actual = ds_cache.attrs['ejecta_model']
+  cache = {name: da.values for name, da in ds_cache.items()}
+  cache['basin'] = ds_cache['basin'].values
+  tasks = [
+    (
+      i_lat, i_lon, lat, lon,
+      {var: arr[i_lat, i_lon, :] if (arr.ndim > 1) else arr for var, arr in cache.items()}
+    ) 
+    for i_lat, lat in enumerate(grid_lats) 
+    for i_lon, lon in enumerate(grid_lons)
+  ]
   if verbose > 0:
     print(f"Pre-computation completed in {time.time() - t0:.1f} seconds.")
-  nbasin     = len(ds_b['basin']) + 1 #+1 for pre-impact component
+  nbasin     = len(ds_basin_chronological['basin']) + 1 #+1 for pre-impact component
   nlat       = len(grid_lats)
   nlon       = len(grid_lons)
   nelevation = len(elevation)
@@ -1722,7 +1715,13 @@ def build_global_mixing_dataset_parallel(
   t1 = time.time()
   with ProcessPoolExecutor(
     initializer = _worker_init,
-    initargs = (ds_b, elevation, preimpact_label, verbose-1)
+    initargs = (
+      ds_basin_chronological['basin'].values, 
+      elevation, 
+      ejecta_model_actual, 
+      preimpact_label, 
+      verbose - 1
+    )
   ) as executor:
     t2 = time.time()
     if verbose > 0:
@@ -1737,7 +1736,7 @@ def build_global_mixing_dataset_parallel(
       total = len(futures), 
       desc = "Computing profiles at each grid point (parallel)", 
       mininterval = 2.0,
-      disable = verbose<1
+      disable = verbose < 1
     ):
       pid, i_lat, i_lon, thickness_total_val, thickness_primary_val, abundance_val = f.result()
       used_pids.add(pid)
@@ -1755,7 +1754,7 @@ def build_global_mixing_dataset_parallel(
     coords = {
       'lat': grid_lats,
       'lon': grid_lons,
-      'basin': np.concatenate(([preimpact_label or 'preimpact'], ds_b['basin'].values)),
+      'basin': np.concatenate(([preimpact_label or 'preimpact'], ds_basin_chronological['basin'].values)),
       'elevation': np.flip(elevation),
     }
   )
