@@ -3,6 +3,9 @@ import matplotlib.pyplot as plt
 import xarray as xr
 import copy, warnings, functools, os, time
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing.shared_memory import SharedMemory
+from threadpoolctl import threadpool_limits
 from scipy.integrate import cumulative_simpson
 from numba import njit
 from tqdm import tqdm
@@ -10,7 +13,6 @@ from cartoplanet import config
 
 body = config['BODY']['body']
 TEST = True
-PRECOMPUTE_SOI = True
 
 
 ### //General utility//
@@ -1595,7 +1597,8 @@ def _worker_init(
     elevation: np.ndarray,
     ejecta_model: EjectaModel,
     preimpact_label: str,
-    verbose: int
+    verbose: int,
+    shm_info: dict
 ) -> None:
   """Initializer for worker processes in parallel vertical mixing. Not intended for external use."""
   _worker_static['basins']          = basins
@@ -1603,6 +1606,12 @@ def _worker_init(
   _worker_static['ejecta_model']    = ejecta_model
   _worker_static['preimpact_label'] = preimpact_label
   _worker_static['verbose']         = verbose
+  # Attach shared memory allocations
+  _worker_static['_shm_handles'] = []
+  for key, (name, shape, dtype) in shm_info.items():
+    shm = SharedMemory(name=name, create=False)
+    _worker_static[f'out_{key}'] = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+    _worker_static['_shm_handles'].append(shm)
   return
 
 def _worker_mixing_profile(args: tuple) -> tuple:
@@ -1629,13 +1638,10 @@ def _worker_mixing_profile(args: tuple) -> tuple:
       preimpact_label = preimpact_label,
       verbose = verbose,
     )
-  data = (
-    os.getpid(),
-    i_lat, i_lon,
-    ds['thickness_total'].item(),
-    ds['thickness_primary'].values[0, 0, :], #shape (nbasin,)
-    ds['abundance'].values[0, 0, :, :]       #shape (nbasin, nelevation)
-  )
+  _worker_static['out_thickness_total'][i_lat, i_lon]      = ds['thickness_total'].item()
+  _worker_static['out_thickness_primary'][i_lat, i_lon, :] = ds['thickness_primary'].values[0, 0, :]
+  _worker_static['out_abundance'][i_lat, i_lon, :, :]      = ds['abundance'].values[0, 0, :, :]
+  data = (os.getpid(), i_lat, i_lon)
   return data
 
 def build_global_mixing_dataset_parallel(
@@ -1645,6 +1651,7 @@ def build_global_mixing_dataset_parallel(
   grid_lons: list | np.ndarray,
   ejecta_model: dict | EjectaModel = None,
   preimpact_label: str = None,
+  max_workers: int = None,
   verbose: int = 1
 ) -> xr.Dataset:
   """
@@ -1678,7 +1685,7 @@ def build_global_mixing_dataset_parallel(
     - thickness_total   : total thickness of primary ejecta + local excavation at each location
     - abundance         : area or volume fraction of each basin's primary ejecta at each elevation
   """
-  from concurrent.futures import ProcessPoolExecutor, as_completed
+  ### //Procompute the ballistic sedimentation parameters for each basin at each grid point//
   ds_basin_chronological = ds_basin.sortby('order', ascending=True)
   t0 = time.time()
   with warnings.catch_warnings():
@@ -1695,6 +1702,7 @@ def build_global_mixing_dataset_parallel(
   ejecta_model_actual = ds_cache.attrs['ejecta_model']
   cache = {name: da.values for name, da in ds_cache.items()}
   cache['basin'] = ds_cache['basin'].values
+  ### //Define the parallel processing task inputs//
   tasks = [
     (
       i_lat, i_lon, lat, lon,
@@ -1705,6 +1713,7 @@ def build_global_mixing_dataset_parallel(
   ]
   if verbose > 0:
     print(f"Pre-computation completed in {time.time() - t0:.1f} seconds.")
+  ### //Initialize output arrays and shared memory for parallel processing//
   nbasin     = len(ds_basin_chronological['basin']) + 1 #+1 for pre-impact component
   nlat       = len(grid_lats)
   nlon       = len(grid_lons)
@@ -1712,39 +1721,58 @@ def build_global_mixing_dataset_parallel(
   thickness_total   = np.zeros((nlat, nlon))
   thickness_primary = np.zeros((nlat, nlon, nbasin))
   abundance         = np.zeros((nlat, nlon, nbasin, nelevation))
+  _shm_thickness_total = SharedMemory(create=True, size=thickness_total.nbytes)
+  _shm_thickness_primary = SharedMemory(create=True, size=thickness_primary.nbytes)
+  _shm_abundance = SharedMemory(create=True, size=abundance.nbytes)
+  shm_info = {
+    'thickness_total': (_shm_thickness_total.name, thickness_total.shape, thickness_total.dtype),
+    'thickness_primary': (_shm_thickness_primary.name, thickness_primary.shape, thickness_primary.dtype),
+    'abundance': (_shm_abundance.name, abundance.shape, abundance.dtype),
+  }
+  ### //Run the parallel vertical mixing//
   t1 = time.time()
-  with ProcessPoolExecutor(
-    initializer = _worker_init,
-    initargs = (
-      ds_basin_chronological['basin'].values, 
-      elevation, 
-      ejecta_model_actual, 
-      preimpact_label, 
-      verbose - 1
-    )
-  ) as executor:
-    t2 = time.time()
-    if verbose > 0:
-      print(f"Worker initialization completed in {t2 - t1:.1f} seconds. Beginning parallel vertical mixing.")
-      print(f"{executor._max_workers} workers available for parallel vertical mixing.")
-    futures = [executor.submit(_worker_mixing_profile, t) for t in tasks]
-    used_pids = set()
-    if verbose > 0:
-      print(f"Futures computed in {time.time() - t2:.1f} seconds.")
-    for f in tqdm(
-      as_completed(futures), 
-      total = len(futures), 
-      desc = "Computing profiles at each grid point (parallel)", 
-      mininterval = 2.0,
-      disable = verbose < 1
-    ):
-      pid, i_lat, i_lon, thickness_total_val, thickness_primary_val, abundance_val = f.result()
-      used_pids.add(pid)
-      thickness_total[i_lat, i_lon]      = thickness_total_val
-      thickness_primary[i_lat, i_lon, :] = thickness_primary_val
-      abundance[i_lat, i_lon, :, :]      = abundance_val
+  try:
+    with ProcessPoolExecutor(
+      max_workers = max_workers,
+      initializer = _worker_init,
+      initargs = (
+        ds_basin_chronological['basin'].values, 
+        elevation, 
+        ejecta_model_actual, 
+        preimpact_label, 
+        verbose - 1,
+        shm_info
+      ),
+    ) as executor:
+      t2 = time.time()
+      if verbose > 0:
+        print(f"Worker initialization completed in {t2 - t1:.1f} seconds. Beginning parallel vertical mixing.")
+        print(f"{executor._max_workers} workers available for parallel vertical mixing.")
+      # Compute the futures
+      futures = [executor.submit(_worker_mixing_profile, t) for t in tasks]
+      used_pids = set()
+      if verbose > 0:
+        print(f"Futures computed in {time.time() - t2:.1f} seconds.")
+      for f in tqdm(
+        as_completed(futures), 
+        total       = len(futures), 
+        desc        = "Computing profiles at each grid point (parallel)", 
+        mininterval = 2.0,
+        disable     = verbose < 1
+      ):
+        pid, i_lat, i_lon = f.result()
+        used_pids.add(pid)
+    # Transfer the results from shared memory to the output arrays
+    thickness_total[:, :]      = np.ndarray(thickness_total.shape, dtype=thickness_total.dtype, buffer=_shm_thickness_total.buf)
+    thickness_primary[:, :, :] = np.ndarray(thickness_primary.shape, dtype=thickness_primary.dtype, buffer=_shm_thickness_primary.buf)
+    abundance[:, :, :, :]      = np.ndarray(abundance.shape, dtype=abundance.dtype, buffer=_shm_abundance.buf)
     if verbose > 0:
       print(f"All profiles computed. Maximum concurrent workers used: {len(used_pids)}.")
+  finally: # Clean up shared memory
+    for shm in (_shm_thickness_total, _shm_thickness_primary, _shm_abundance):
+      shm.close()
+      shm.unlink()
+  ### //Define and return the final dataset//
   ds_profiles = xr.Dataset(
     {
       'thickness_total':   (('lat', 'lon'), thickness_total),
