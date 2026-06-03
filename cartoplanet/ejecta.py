@@ -1464,7 +1464,7 @@ def compute_ejecta_mixing_multi_basin_precached(
   else:
     elevation       = np.asarray(elevation)                                       #[m]
   ### //Run the chronological vertical mixing//
-  abundances        = np.where(elevation[:, None] < 0, 1.0, 0.0)
+  abundances        = np.where(elevation[:, None] <= 0, 1.0, 0.0)
   abundances_iflast = abundances.copy()
   for idx in tqdm(
     idx_basins,
@@ -1763,7 +1763,7 @@ def build_global_mixing_dataset_parallel(
       futures = [executor.submit(_worker_mixing_profile, t) for t in tasks]
       used_pids = set()
       if verbose > 0:
-        print(f"Futures computed in {time.time() - t2:.1f} seconds.")
+        print(f"Futures submitted in {time.time() - t2:.1f} seconds.")
       for f in tqdm(
         as_completed(futures), 
         total       = len(futures), 
