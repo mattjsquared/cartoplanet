@@ -46,6 +46,103 @@ def great_circle_distance(lat1, lon1, lat2, lon2, R=config.getfloat(body, "R0")/
   return 2 * R * np.arcsin(np.sqrt(a))
 
 
+### //Non-ballistic sedimentation functions//
+def compute_excavated_component_concentration(
+    ds_basin: xr.Dataset,
+    layer_thicknesses: list | np.ndarray,
+    layer_concentrations: list | np.ndarray,
+) -> xr.Dataset:
+  """
+  Compute the homogenized concentration of a component of varying concentration in basin-excavated layers.
+
+  Parameters
+  ----------
+  ds_basin : xr.Dataset
+    Must contain:
+    - basin : str
+    - Rat   : float, km
+  layer_thicknesses : list or np.ndarray
+    Thickness in km of each layer in the basin-excavated column, listed in order from top to bottom. Excludes mantle layer, which is assumed to extend from the bottom of the last layer downward.
+  layer_concentrations : list or np.ndarray
+    Concentration of the component in each layer. Must be of length len(layer_thicknesses)+1, with the last value corresponding to the mantle concentration.
+  
+  Returns
+  -------
+  concentrations : xr.Dataset
+    Dataset containing coordinates:
+    - basin : str -- name of basin
+    and data variables:
+    - concentration : float -- concentration of component of interest in the homogenized primary ejecta of each basin
+  """
+  ### Validate inputs
+  if np.any(np.isnan(ds_basin['Rat'].values)):
+    raise ValueError("`ds_basin['Rat']` contains NaN values.")
+  if len(layer_concentrations) != len(layer_thicknesses) + 1:
+    raise ValueError("`layer_concentrations` must be of length `len(layer_thicknesses) + 1`, with the last value corresponding to the mantle concentration.")
+  ### Initialize variables
+  # Basin info
+  nbasins           = len(ds_basin['basin'])
+  Rat               = ds_basin.Rat.values                               #[km]
+  dex               = Rat / 5                                           #[km] -- equivalent to Dat / 10
+  # Layer info
+  h_layers          = np.asarray(layer_thicknesses)                     #[km]
+  d_layerbottoms    = np.cumsum(h_layers)                               #[km] -- depth of bottom of each layer from pre-impact surface
+  d_layerbottoms    = np.concatenate((d_layerbottoms, [np.inf]))        #add a final "layer" for the mantle that extends to infinite depth
+  d_layerbottoms    = np.minimum(d_layerbottoms[:, None], dex[None, :]) #[km] -- limit bottom depth to dex
+  d_layertops       = np.concatenate((np.zeros((1, nbasins)), d_layerbottoms[:-1, :]), axis=0) #[km] -- depth of top of each layer from pre-impact surface
+  X_layers          = np.asarray(layer_concentrations)                  #[any]
+  # Volume info
+  Vexcavated_total  = np.pi / 10 * Rat**3                               #[km^3] -- total volume (paraboloid) of material excavated between the pre-impact surface and dex
+  ### Calculate excavated volume from each layer
+  V_prefactor = (np.pi / (2 * dex[None, :])) * Rat[None, :]**2
+  Vexcavated_layers = V_prefactor * ( ((dex - d_layertops)**2) - ((dex - d_layerbottoms)**2) )
+  ### Ensure that sum of excavated volumes matches total excavated volume
+  if not np.allclose(np.sum(Vexcavated_layers, axis=0), Vexcavated_total):
+    raise ValueError(f"Sum of excavated volumes from layers does not match total excavated volume.")
+  ### Compute concentration of component in homogenized ejecta
+  Vratio_layers = Vexcavated_layers / Vexcavated_total[None, :]       #[volume fraction]
+  Xexcavated    = np.sum(X_layers[:, None] * Vratio_layers, axis=0) #[any]
+  # Format output
+  concentrations = xr.Dataset(
+    {
+      'concentration': (('basin',), Xexcavated)
+    },
+    coords = {'basin': ds_basin.basin.values}
+  )
+  return concentrations
+
+
+def fill_basin_Rat(
+    ds_basin: xr.Dataset
+) -> xr.Dataset:
+  """
+  Fill in missing Rat values in ds_basin using an empirical relationship derived from D's of Neumann et al. (2015), Dat's of Miljković et al. (2016), and SPA Dat from Rajšić (2025, personal communication).
+
+  Parameters
+  ----------
+  ds_basin : xr.Dataset
+    Must contain:
+    - basin : str
+    - R     : float, km
+    - Rat   : float, km (can be NaN or None for basins to fill)
+
+  Returns
+  -------
+  ds_basin_filled : xr.Dataset
+    Same as input ds_basin but with missing Rat values filled in.
+  """
+  # Empirical relationship derived from D's of Neumann et al. (2015), Dat's of
+  # Miljković et al. (2016), and SPA Dat from Rajšić (2025, personal communication)
+  R          = ds_basin.R.values
+  Rat_actual = ds_basin.Rat.values
+  x1_temp, x0_temp = [0.38, 38.18] #[dimensionless, km] -- empirical relationship INCLUDING SPA
+  Rat_estimate = x1_temp*R + x0_temp
+  Rat_out = np.where(np.isnan(Rat_actual), Rat_estimate, Rat_actual)
+  ds_basin_filled = ds_basin.copy()
+  ds_basin_filled['Rat'] = (('basin',), Rat_out)
+  return ds_basin_filled
+
+
 ### //Validation functions -- compare against output from equivalent ejecta_benchmark.py functions//
 def Xie_figure5(grid=False) -> tuple:
   """
@@ -1660,6 +1757,7 @@ def build_global_mixing_dataset_parallel(
   elevation: np.ndarray,
   grid_lats: list | np.ndarray,
   grid_lons: list | np.ndarray,
+  radius_cutoff: float = None,
   ejecta_model: dict | EjectaModel = None,
   preimpact_label: str = None,
   max_workers: int = None,
@@ -1676,6 +1774,8 @@ def build_global_mixing_dataset_parallel(
     Elevation grid in meters for the vertical mixing profile.
   grid_lats, grid_lons : list or np.ndarray
     Coordinates of the points at which to compute the vertical mixing profiles.
+  radius_cutoff : float, optional
+    Distance (as a factor of basin radius R) beyond which to ignore the contribution of each basin to the mixing profile. If `None`, no basins will be excluded based on distance. Default is `None`.
   ejecta_model : dict or EjectaModel
     If dict, can contain keys as described in the EjectaModel class. If `None`, default parameters from the EjectaModel class will be used.
   preimpact_label : str, optional
@@ -1708,6 +1808,7 @@ def build_global_mixing_dataset_parallel(
       ds_basin = ds_basin_chronological,
       grid_lats = grid_lats,
       grid_lons = grid_lons,
+      radius_cutoff = radius_cutoff,
       ejecta_model = ejecta_model,
     )
   ejecta_model_actual = ds_cache.attrs['ejecta_model']
